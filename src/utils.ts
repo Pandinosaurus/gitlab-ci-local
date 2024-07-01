@@ -6,7 +6,7 @@ import base64url from "base64url";
 import execa from "execa";
 import assert from "assert";
 import {CICDVariable} from "./variables-from-files";
-import {GitData} from "./git-data";
+import {GitData, GitSchema} from "./git-data";
 import globby from "globby";
 import micromatch from "micromatch";
 import axios from "axios";
@@ -196,7 +196,7 @@ export class Utils {
             allowFailure = rule.allow_failure ?? allowFailure;
             ruleVariable = rule.variables;
 
-            if (when === "never") break; // Early return, will not evaluate the remaining rules
+            break; // Early return, will not evaluate the remaining rules
         }
 
         return {when, allowFailure, variables: ruleVariable};
@@ -283,11 +283,12 @@ export class Utils {
         return Object.getPrototypeOf(v) === Object.prototype;
     }
 
-    static async remoteFileExist (file: string, ref: string, domain: string, projectPath: string, protocol: string) {
+    static async remoteFileExist (cwd: string, file: string, ref: string, domain: string, projectPath: string, protocol: GitSchema, port: string) {
         switch (protocol) {
+            case "ssh":
             case "git":
                 try {
-                    await Utils.bash(`git archive --remote=ssh://git@${domain}/${projectPath}.git ${ref} ${file} > /dev/null`);
+                    await Utils.spawn(`git archive --remote=ssh://git@${domain}:${port}/${projectPath}.git ${ref} ${file}`.split(" "), cwd);
                     return true;
                 } catch (e: any) {
                     if (!e.stderr.includes(`remote: fatal: pathspec '${file}' did not match any files`)) throw new Error(e);
@@ -303,8 +304,18 @@ export class Utils {
                     return false;
                 }
             }
-            default:
-                throw new Error(`${protocol} not supported!`);
+            default: {
+                Utils.switchStatementExhaustiveCheck(protocol);
+            }
         }
+    }
+
+    static trimSuffix (str: string, suffix: string) {
+        return str.endsWith(suffix) ? str.slice(0, -suffix.length) : str;
+    }
+
+    static switchStatementExhaustiveCheck (param: never): never {
+        // https://dev.to/babak/exhaustive-type-checking-with-typescript-4l3f
+        throw new Error(`Unhandled case ${param}`);
     }
 }

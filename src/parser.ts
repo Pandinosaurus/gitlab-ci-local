@@ -19,7 +19,8 @@ import {WriteStreams} from "./write-streams";
 import {init as initPredefinedVariables} from "./predefined-variables";
 
 const MAX_FUNCTIONS = 3;
-const INCLUDE_INPUTS_SUPPORTED_TYPES = ["string", "boolean", "number"];
+const INCLUDE_INPUTS_SUPPORTED_TYPES = ["string", "boolean", "number", "array"] as const;
+export type InputType = typeof INCLUDE_INPUTS_SUPPORTED_TYPES[number];
 
 export class Parser {
 
@@ -59,17 +60,24 @@ export class Parser {
         await parser.init();
         const warnings = await Validator.run(parser.jobs, parser.stages);
         const parsingTime = process.hrtime(time);
-        writeStreams.stderr(chalk`{grey parsing and downloads finished} in {grey ${prettyHrtime(parsingTime)}}\n`);
+        const pathToExpandedGitLabCi = path.join(argv.cwd, argv.stateDir, "expanded-gitlab-ci.yml");
+        fs.mkdirpSync(path.join(argv.cwd, argv.stateDir));
+        fs.writeFileSync(pathToExpandedGitLabCi, yaml.dump(parser.gitlabData));
+        writeStreams.stderr(chalk`{grey parsing and downloads finished in ${prettyHrtime(parsingTime)}.}\n`);
 
         for (const warning of warnings) {
             writeStreams.stderr(chalk`{yellow ${warning}}\n`);
         }
 
         // # Second layer of check for errors that are not caught in Validator.run
-        if (parser.argv.enableJsonSchemaValidation) {
+        if (parser.argv.jsonSchemaValidation) {
             const time = process.hrtime();
-            Validator.jsonSchemaValidation(parser.gitlabData);
-            writeStreams.stderr(chalk`{grey json schema validated} in {grey ${prettyHrtime(process.hrtime(time))}}\n`);
+            Validator.jsonSchemaValidation({
+                writeStreams,
+                pathToExpandedGitLabCi,
+                gitLabCiConfig: parser.gitlabData,
+            });
+            writeStreams.stderr(chalk`{grey json schema validated in ${prettyHrtime(process.hrtime(time))}}\n`);
         }
         return parser;
     }
@@ -92,11 +100,11 @@ export class Parser {
         let yamlDataList: any[] = [{stages: [".pre", "build", "test", "deploy", ".post"]}];
         const gitlabCiData = await Parser.loadYaml(`${cwd}/${file}`, {}, this.expandVariables);
 
-        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiData, {cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables}));
+        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiData, {cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables, maximumIncludes: argv.maximumIncludes}));
         ParserIncludes.resetCount();
 
         const gitlabCiLocalData = await Parser.loadYaml(`${cwd}/.gitlab-ci-local.yml`, {}, this.expandVariables);
-        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiLocalData, {cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables}));
+        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiLocalData, {cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables, maximumIncludes: argv.maximumIncludes}));
         ParserIncludes.resetCount();
 
         const gitlabData: any = deepExtend({}, ...yamlDataList);
@@ -193,7 +201,7 @@ export class Parser {
 
                 if (this.argv.needs && this.argv.job.length > 0) {
                     const found = this.jobs.find(j => j.baseName === job);
-                    if (found !== undefined && found.needs !== null) {
+                    if (found?.needs) {
                         jobNeedsLength = found.needs.map(f => f.job.length);
                     }
                 }
@@ -293,8 +301,8 @@ export class Parser {
 
             const interpolatedConfigurations = JSON.stringify(uninterpolatedConfigurations)
                 .replace(
-                    /\$\[\[\s*inputs.(?<interpolationKey>[\w-]+)\s*\|?\s*(?<interpolationFunctions>.*?)\s*\]\]/g // regexr.com/7sh15
-                    , (_: string, interpolationKey: string, interpolationFunctions: string) => {
+                    /(?<firstChar>.)(?<secondChar>.)\$\[\[\s*inputs.(?<interpolationKey>[\w-]+)\s*\|?\s*(?<interpolationFunctions>.*?)\s*\]\](?<lastChar>.)/g // https://regexr.com/81c16
+                    , (_: string, firstChar: string, secondChar: string, interpolationKey: string, interpolationFunctions: string, lastChar: string) => {
                         const configFilePath = path.relative(process.cwd(), filePath);
                         const context = {
                             interpolationKey,
@@ -304,17 +312,29 @@ export class Parser {
                             ...ctx,
                         };
 
-                        validateInterpolationKey(context);
-                        validateInterpolationFunctions(context);
-                        const inputValue = getInputValue(context);
-                        validateInput(inputValue, context);
+                        const {inputValue, inputType} = parseIncludeInputs(context);
+                        const firstTwoChar = firstChar + secondChar;
+                        switch (inputType) {
+                            case "array":
+                                if ((secondChar == "\"" && lastChar == "\"") && firstChar != "\\") {
+                                    return firstChar + JSON.stringify(inputValue);
+                                }
 
-                        const jsonValue = JSON.stringify(inputValue);
-                        // Unquote string if necessary
-                        if (typeof(jsonValue) == "string" && jsonValue.startsWith("\"") && jsonValue.endsWith("\"")) {
-                            return jsonValue.slice(1, -1);
+                                // NOTE: This behaves slightly differently from gitlab.com. I can't come up with practical use case so i don't think it's worth the effort to mimic this
+                                return firstTwoChar + JSON.stringify(JSON.stringify(inputValue)).slice(1, -1) + lastChar;
+                            case "string":
+                                return firstTwoChar
+                                    + JSON.stringify(inputValue) // ensure a valid json string
+                                        .slice(1, -1) // remove the surrounding "
+                                    + lastChar;
+
+                            case "number":
+                            case "boolean":
+                                return firstTwoChar + inputValue + lastChar;
+
+                            default:
+                                Utils.switchStatementExhaustiveCheck(inputType);
                         }
-                        return jsonValue;
                     });
             return JSON.parse(interpolatedConfigurations);
         }
@@ -326,12 +346,49 @@ function isGitlabSpecFile (fileData: any) {
     return "spec" in fileData;
 }
 
+function validateInterpolationKey (ctx: any) {
+    const {configFilePath, interpolationKey, inputsSpecification} = ctx;
+    const invalidInterpolationKeyErr = chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: unknown interpolation key: \`${interpolationKey}\`.`;
+    assert(inputsSpecification.spec.inputs?.[interpolationKey] !== undefined, invalidInterpolationKeyErr);
+}
+
 function validateInterpolationFunctions (ctx: any) {
     const {interpolationFunctions, configFilePath} = ctx;
     if (interpolationFunctions != "") {
         console.log(chalk`{black.bgYellowBright  WARN } interpolation functions is currently not supported via gitlab-ci-local. Functions will just be a no-op.`);
     }
     assert(interpolationFunctions.split("|").length <= MAX_FUNCTIONS, chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: too many functions in interpolation block.`);
+}
+
+function validateInput (ctx: any) {
+    const {configFilePath, interpolationKey, inputsSpecification} = ctx;
+    const inputValue = getInputValue(ctx);
+
+    const options = inputsSpecification.spec.inputs[interpolationKey]?.options;
+    if (options) {
+        assert(options.includes(inputValue),
+            chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: \`{blueBright ${inputValue}}\` cannot be used because it is not in the list of allowed options.`);
+    }
+
+    const expectedInputType = getExpectedInputType(ctx);
+    assert(INCLUDE_INPUTS_SUPPORTED_TYPES.includes(expectedInputType),
+        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: header:spec:inputs:{blueBright ${interpolationKey}} input type unknown value: {blueBright ${expectedInputType}}.`);
+
+    const inputType = Array.isArray(inputValue) ? "array" : typeof inputValue;
+    assert(inputType === expectedInputType,
+        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: provided value is not a {blueBright ${expectedInputType}}.`);
+
+    const regex = inputsSpecification.spec.inputs[interpolationKey]?.regex;
+    if (regex) {
+        console.log(chalk`{black.bgYellowBright  WARN } spec:inputs:regex is currently not supported via gitlab-ci-local. This will just be a no-op.`);
+    }
+}
+
+function parseIncludeInputs (ctx: any): {inputValue: any; inputType: InputType} {
+    validateInterpolationKey(ctx);
+    validateInterpolationFunctions(ctx);
+    validateInput(ctx);
+    return {inputValue: getInputValue(ctx), inputType: getExpectedInputType(ctx)};
 }
 
 function getInputValue (ctx: any) {
@@ -341,29 +398,7 @@ function getInputValue (ctx: any) {
     return inputValue;
 }
 
-function validateInterpolationKey (ctx: any): any {
-    const {configFilePath, interpolationKey, inputsSpecification} = ctx;
-    const invalidInterpolationKeyErr = chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: unknown interpolation key: \`${interpolationKey}\`.`;
-    assert(inputsSpecification.spec.inputs?.[interpolationKey] !== undefined, invalidInterpolationKeyErr);
-}
-
-function validateInput (inputValue: any, ctx: any): any {
-    const {configFilePath, interpolationKey, inputsSpecification} = ctx;
-
-    const options = inputsSpecification.spec.inputs[interpolationKey]?.options;
-    if (options) {
-        assert(options.includes(inputValue),
-            chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: \`{blueBright ${inputValue}}\` cannot be used because it is not in the list of allowed options.`);
-    }
-
-    const type = inputsSpecification.spec.inputs[interpolationKey]?.type || "string";
-    assert(INCLUDE_INPUTS_SUPPORTED_TYPES.includes(type),
-        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: header:spec:inputs:{blueBright ${interpolationKey}} input type unknown value: {blueBright ${type}}.`);
-    assert(typeof inputValue == type,
-        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: provided value is not a {blueBright ${type}}.`);
-
-    const regex = inputsSpecification.spec.inputs[interpolationKey]?.regex;
-    if (regex) {
-        console.log(chalk`{black.bgYellowBright  WARN } spec:inputs:regex is currently not supported via gitlab-ci-local. This will just be a no-op.`);
-    }
+function getExpectedInputType (ctx: any): InputType {
+    const {interpolationKey, inputsSpecification} = ctx;
+    return inputsSpecification.spec.inputs[interpolationKey]?.type || "string";
 }

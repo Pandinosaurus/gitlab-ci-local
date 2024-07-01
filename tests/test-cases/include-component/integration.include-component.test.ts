@@ -37,22 +37,21 @@ test.concurrent("include-component component (protocol: https)", async () => {
     const expected = `---
 stages:
   - .pre
-  - format
-  - build
-  - test
-  - latest
+  - format-override
+  - build-override
+  - test-override
   - .post
 format-latest:
   image:
     name: golang:latest
-  stage: format
+  stage: format-override
   script:
     - go fmt $(go list ./... | grep -v /vendor/)
     - go vet $(go list ./... | grep -v /vendor/)
 build-latest:
   image:
     name: golang:latest
-  stage: build
+  stage: build-override
   script:
     - mkdir -p mybinaries
     - go build -o mybinaries ./...
@@ -62,9 +61,30 @@ build-latest:
 test-latest:
   image:
     name: golang:latest
-  stage: test
+  stage: test-override
   script:
     - go test -race $(go list ./... | grep -v /vendor/)`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-component local component", async () => {
+    const writeStreams = new WriteStreamsMock();
+
+    await handler({
+        cwd: "tests/test-cases/include-component/component-local",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - my-stage
+  - .post
+component-job:
+  script:
+    - echo job 1
+  stage: my-stage`;
 
     expect(writeStreams.stdoutLines[0]).toEqual(expected);
 });

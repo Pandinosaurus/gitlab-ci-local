@@ -3,6 +3,8 @@ import assert, {AssertionError} from "assert";
 import {WriteStreams} from "./write-streams";
 import chalk from "chalk";
 
+export type GitSchema = "git" | "http" | "https" | "ssh";
+
 export class GitData {
 
     public readonly user = {
@@ -17,7 +19,7 @@ export class GitData {
     };
 
     public readonly remote = {
-        schema: "git",
+        schema: "git" as GitSchema,
         port: "22",
         host: "gitlab.com",
         group: "fallback.group",
@@ -28,6 +30,7 @@ export class GitData {
         REF_NAME: "main",
         SHA: "0000000000000000000000000000000000000000",
         SHORT_SHA: "00000000",
+        TIMESTAMP: new Date().toISOString().split(".")[0] + "Z",
     };
 
     static async init (cwd: string, writeStreams: WriteStreams): Promise<GitData> {
@@ -71,10 +74,10 @@ export class GitData {
         } catch (e: any) {
             if (e.stderr === "fatal: ref refs/remotes/origin/HEAD is not a symbolic ref") {
                 writeStreams.stderr(chalk`{yellow Unable to retrieve default remote branch, falling back to \`${this.branches.default}\`.
-  The default remote branch can be set via \`git remote set-head origin <default_branch>\`}
-`);
+  The default remote branch can be set via \`git remote set-head origin <default_branch>\`
+}`);
             } else {
-                throw e;
+                writeStreams.stderr(chalk`{yellow Unable to retrieve default remote branch, falling back to \`${this.branches.default}\`.\n}`);
             }
         }
     }
@@ -109,7 +112,7 @@ export class GitData {
                 this.remote.host = gitRemoteMatch.groups.host;
                 this.remote.group = gitRemoteMatch.groups.group;
                 this.remote.project = gitRemoteMatch.groups.project;
-                this.remote.schema = gitRemoteMatch.groups.schema;
+                this.remote.schema = gitRemoteMatch.groups.schema as GitSchema;
                 this.remote.port = port;
             } else if (gitRemote.startsWith("ssh://")) {
                 gitRemoteMatch = /(?<schema>ssh):\/\/(\w+)@(?<host>[^/:]+):?(?<port>\d+)?\/(?<group>\S+)\/(?<project>\S+)\.git/.exec(gitRemote); // regexr.com/7vjq4
@@ -118,17 +121,17 @@ export class GitData {
                 this.remote.host = gitRemoteMatch.groups.host;
                 this.remote.group = gitRemoteMatch.groups.group;
                 this.remote.project = gitRemoteMatch.groups.project;
-                this.remote.schema = gitRemoteMatch.groups.schema;
+                this.remote.schema = gitRemoteMatch.groups.schema as GitSchema;
                 this.remote.port = gitRemoteMatch.groups.port ?? "22";
             } else {
-                gitRemoteMatch = /(?<username>\S+)@(?<host>[^:]+):(?<group>\S+)\/(?<project>\S+)\.git/.exec(gitRemote); // regexr.com/7vjoq
+                gitRemoteMatch = /(?<username>\S+)@(?<host>[^:]+):(?<group>\S+)\/(?<project>\S+)/.exec(gitRemote); // regexr.com/7vjoq
                 assert(gitRemoteMatch?.groups != null, "git remote get-url origin didn't provide valid matches");
 
                 const {stdout} = await Utils.spawn(["ssh", "-G", `${gitRemoteMatch.groups.username}@${gitRemoteMatch.groups.host}`]);
                 const port = stdout.split("\n").filter((line) => line.startsWith("port "))[0].split(" ")[1];
                 this.remote.host = gitRemoteMatch.groups.host;
                 this.remote.group = gitRemoteMatch.groups.group;
-                this.remote.project = gitRemoteMatch.groups.project;
+                this.remote.project = Utils.trimSuffix(gitRemoteMatch.groups.project, ".git");
                 this.remote.schema = "git";
                 this.remote.port = port;
             }

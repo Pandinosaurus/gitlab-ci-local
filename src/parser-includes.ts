@@ -17,9 +17,8 @@ type ParserIncludesInitOptions = {
     fetchIncludes: boolean;
     variables: {[key: string]: string};
     expandVariables: boolean;
+    maximumIncludes: number;
 };
-
-const MAXIMUM_INCLUDE = 150; // https://docs.gitlab.com/ee/administration/settings/continuous_integration.html#maximum-includes
 
 export class ParserIncludes {
     private static count: number = 0;
@@ -31,8 +30,8 @@ export class ParserIncludes {
     static async init (gitlabData: any, opts: ParserIncludesInitOptions): Promise<any[]> {
         this.count++;
         assert(
-            this.count <= MAXIMUM_INCLUDE + 1, // 1st init call is not counted
-            chalk`This GitLab CI configuration is invalid: Maximum of {blueBright ${MAXIMUM_INCLUDE}} nested includes are allowed!.`
+            this.count <= opts.maximumIncludes + 1, // 1st init call is not counted
+            chalk`This GitLab CI configuration is invalid: Maximum of {blueBright ${opts.maximumIncludes}} nested includes are allowed!. This limit can be increased with the --maximum-includes cli flags.`
         );
         let includeDatas: any[] = [];
         const promises = [];
@@ -99,6 +98,7 @@ export class ParserIncludes {
                             project: value["project"],
                             file: inner["local"].replace(/^\//, ""),
                             ref: value["ref"],
+                            inputs: inner.inputs || {},
                         };
                     });
 
@@ -108,17 +108,35 @@ export class ParserIncludes {
                 const {domain, projectPath, componentName, ref} = this.parseIncludeComponent(value["component"]);
                 // converts component to project
                 const files = [`${componentName}.yml`, `${componentName}/template.yml`, null];
+
                 for (const f of files) {
                     assert(f !== null, `This GitLab CI configuration is invalid: component: \`${value["component"]}\`. One of the file [${files}] must exists in \`${domain}/${projectPath}\``);
-                    if (!(await Utils.remoteFileExist(f, ref, domain, projectPath, gitData.remote.schema))) continue;
-                    const fileDoc = {
-                        include: {
-                            project: projectPath,
-                            file: f,
-                            ref: ref,
-                        },
-                    };
-                    includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
+
+                    const isLocalComponent = projectPath === `${gitData.remote.group}/${gitData.remote.project}` && ref === gitData.commit.SHA;
+                    if (isLocalComponent) {
+                        const localComponentInclude = `${cwd}/${f}`;
+                        if (!(await fs.pathExists(localComponentInclude))) {
+                            continue;
+                        }
+
+                        const content = await Parser.loadYaml(localComponentInclude, {inputs: value.inputs || {}}, expandVariables);
+                        includeDatas = includeDatas.concat(await this.init(content, opts));
+                        break;
+                    } else {
+                        if (!(await Utils.remoteFileExist(cwd, f, ref, domain, projectPath, gitData.remote.schema, gitData.remote.port))) {
+                            continue;
+                        }
+
+                        const fileDoc = {
+                            include: {
+                                project: projectPath,
+                                file: f,
+                                ref: ref,
+                                inputs: value.inputs || {},
+                            },
+                        };
+                        includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
+                    }
                     break;
                 }
             } else if (value["template"]) {
