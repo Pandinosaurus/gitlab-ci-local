@@ -1,11 +1,13 @@
-import {WriteStreams} from "./write-streams";
-import {GitData} from "./git-data";
-import * as fs from "fs-extra";
+import {WriteStreams} from "./write-streams.js";
+import {GitData} from "./git-data.js";
+import fs from "fs-extra";
 import * as yaml from "js-yaml";
-import chalk from "chalk";
-import {Argv} from "./argv";
-import assert from "assert";
-import {Utils} from "./utils";
+import chalk from "chalk-template";
+import {Argv} from "./argv.js";
+import assert from "node:assert";
+import path from "node:path";
+import {Utils} from "./utils.js";
+import dotenv from "dotenv";
 
 export interface CICDVariable {
     type: "file" | "variable";
@@ -32,17 +34,31 @@ export class VariablesFromFiles {
         let homeFileData: any = {};
 
         if (remoteVariables && !autoCompleting) {
-            const match = /(?<url>git@.*?)=(?<file>.*?)=(?<ref>.*)/.exec(remoteVariables);
-            assert(match != null, "--remote-variables is malformed use 'git@gitlab.com:firecow/example.git=gitlab-variables.yml=master' syntax");
-            const url = match.groups?.url;
-            const file = match.groups?.file;
-            const ref = match.groups?.ref;
-            const res = await Utils.bash(`set -eou pipefail; git archive --remote=${url} ${ref} ${file} | tar -xO ${file}`, cwd);
-            remoteFileData = yaml.load(`${res.stdout}`);
+            const downloads = await Promise.all(remoteVariables.map(async (remoteVariable) => {
+                const match = /(?<url>git@.*?)=(?<file>.*?)=(?<ref>.*)/.exec(remoteVariable);
+                assert(match != null, "--remote-variables is malformed use 'git@gitlab.com:firecow/example.git=gitlab-variables.yml=master' syntax");
+                const url = match.groups?.url;
+                const file = match.groups?.file;
+                const ref = match.groups?.ref;
+                const time = process.hrtime();
+                const safeFile = Utils.safeBashString(file ?? "");
+                const res = await Utils.bash(`set -eou pipefail; git archive --remote=${Utils.safeBashString(url ?? "")} -- ${Utils.safeBashString(ref ?? "")} ${safeFile} | tar -xO -- ${safeFile}`, cwd);
+                return {url, file, ref, res, duration: process.hrtime(time)};
+            }));
+            for (const {url, file, ref, res, duration} of downloads) {
+                writeStreams.stderr(chalk`{grey downloaded ${url} ${ref} ${file} in ${Utils.prettyHrtime(duration)}}\n`);
+                const loadedYaml = yaml.load(`${res.stdout}`);
+                // Check if loadedYaml is an object
+                if (typeof loadedYaml === "object" && loadedYaml !== null) {
+                    remoteFileData = Utils.deepMerge(remoteFileData, loadedYaml);
+                }
+            }
         }
 
         if (await fs.pathExists(homeVariablesFile)) {
             homeFileData = yaml.load(await fs.readFile(homeVariablesFile, "utf8"), {schema: yaml.FAILSAFE_SCHEMA});
+            const unknownKeys = Object.keys(homeFileData ?? {}).filter((key) => !["global", "group", "project"].includes(key));
+            assert(unknownKeys.length === 0, `${homeVariablesFile} has unknown top-level keys ${unknownKeys.join(", ")}, move them under global:, group: or project:`);
         }
 
         const unpack = (v: any): {values: any; type: "file" | "variable" | null} => {
@@ -56,36 +72,36 @@ export class VariablesFromFiles {
             }
             return v;
         };
-        const addToVariables = async (key: string, val: any, scopePriority: number) => {
+        const addToVariables = (key: string, val: any, scopePriority: number, isDotEnv = false) => {
             const {type, values} = unpack(val);
             for (const [matcher, content] of Object.entries(values)) {
                 assert(typeof content == "string", `${key}.${matcher} content must be text or multiline text`);
-                if (type === "variable" || (type === null && !/^[/|~]/.exec(content))) {
-                    const regexp = matcher === "*" ? /.*/g : new RegExp(`^${matcher.replace(/\*/g, ".*")}$`, "g");
-                    variables[key] = variables[key] ?? {type: "variable", environments: []};
+                const regexp = matcher === "*" ? /.*/g : new RegExp(`^${matcher.replaceAll("*", ".*")}$`, "g");
+                const isFilePath = type === null && /^[/~]/.test(content);
+                if (!isDotEnv && type === "file") {
+                    variables[key] = variables[key] ?? {type: "file", environments: []};
                     variables[key].environments.push({content, regexp, regexpPriority: matcher.length, scopePriority});
-                } else if (type === null && /^[/|~]/.exec(content)) {
+                    continue;
+                }
+                if (!isDotEnv && isFilePath) {
                     const fileSource = content.replace(/^~\/(.*)/, `${homeDir}/$1`);
-                    const regexp = matcher === "*" ? /.*/g : new RegExp(`^${matcher.replace(/\*/g, ".*")}$`, "g");
                     variables[key] = variables[key] ?? {type: "file", environments: []};
                     if (fs.existsSync(fileSource)) {
                         variables[key].environments.push({content, regexp, regexpPriority: matcher.length, scopePriority, fileSource});
                     } else {
                         variables[key].environments.push({content: `warn: ${key} is pointing to invalid path\n`, regexp, regexpPriority: matcher.length, scopePriority});
                     }
-                } else if (type === "file") {
-                    const regexp = matcher === "*" ? /.*/g : new RegExp(`^${matcher.replace(/\*/g, ".*")}$`, "g");
-                    variables[key] = variables[key] ?? {type: "file", environments: []};
-                    variables[key].environments.push({content, regexp, regexpPriority: matcher.length, scopePriority});
-                } else {
-                    assert(false, `${key} was not handled properly`);
+                    continue;
                 }
+                assert(isDotEnv || type === "variable" || type === null, `${key} was not handled properly`);
+                variables[key] = variables[key] ?? {type: "variable", environments: []};
+                variables[key].environments.push({content, regexp, regexpPriority: matcher.length, scopePriority});
             }
         };
 
-        const addVariableFileToVariables = async (fileData: any, filePriority: number) => {
+        const addVariableFileToVariables = (fileData: any, filePriority: number) => {
             for (const [globalKey, globalEntry] of Object.entries(fileData?.global ?? {})) {
-                await addToVariables(globalKey, globalEntry, 1 + filePriority);
+                addToVariables(globalKey, globalEntry, 1 + filePriority);
             }
 
             const groupUrl = `${gitData.remote.host}/${gitData.remote.group}/`;
@@ -94,7 +110,7 @@ export class VariablesFromFiles {
                 assert(groupEntries != null, "groupEntries cannot be null/undefined");
                 assert(Utils.isObject(groupEntries), "group entries in variable files must be an object");
                 for (const [k, v] of Object.entries(groupEntries)) {
-                    await addToVariables(k, v, 2 + filePriority);
+                    addToVariables(k, v, 2 + filePriority);
                 }
             }
 
@@ -104,21 +120,36 @@ export class VariablesFromFiles {
                 assert(projectEntries != null, "projectEntries cannot be null/undefined");
                 assert(Utils.isObject(projectEntries), "project entries in variable files must be an object");
                 for (const [k, v] of Object.entries(projectEntries)) {
-                    await addToVariables(k, v, 3 + filePriority);
+                    addToVariables(k, v, 3 + filePriority);
                 }
             }
         };
 
-        await addVariableFileToVariables(remoteFileData, 0);
-        await addVariableFileToVariables(homeFileData, 10);
+        addVariableFileToVariables(remoteFileData, 0);
+        addVariableFileToVariables(homeFileData, 10);
 
-        const projectVariablesFile = `${argv.cwd}/.gitlab-ci-local-variables.yml`;
+        const projectVariablesFile = path.resolve(argv.cwd, argv.variablesFile);
         if (fs.existsSync(projectVariablesFile)) {
-            const projectVariablesFileData: any = yaml.load(await fs.readFile(projectVariablesFile, "utf8"), {schema: yaml.FAILSAFE_SCHEMA}) ?? {};
+            let isDotEnvFormat = false;
+            const projectVariablesFileRawContent = await fs.readFile(projectVariablesFile, "utf8");
+            let projectVariablesFileData;
+            try {
+                projectVariablesFileData = yaml.load(projectVariablesFileRawContent, {schema: yaml.FAILSAFE_SCHEMA}) ?? {};
+
+                if (typeof(projectVariablesFileData) === "string") {
+                    isDotEnvFormat = true;
+                    projectVariablesFileData = dotenv.parse(projectVariablesFileRawContent);
+                }
+            } catch (e) {
+                if (e instanceof yaml.YAMLException) {
+                    isDotEnvFormat = true;
+                    projectVariablesFileData = dotenv.parse(projectVariablesFileRawContent);
+                }
+            }
             assert(projectVariablesFileData != null, "projectEntries cannot be null/undefined");
             assert(Utils.isObject(projectVariablesFileData), `${argv.cwd}/.gitlab-ci-local-variables.yml must contain an object`);
             for (const [k, v] of Object.entries(projectVariablesFileData)) {
-                await addToVariables(k, v, 24);
+                addToVariables(k, v, 24, isDotEnvFormat);
             }
         }
 

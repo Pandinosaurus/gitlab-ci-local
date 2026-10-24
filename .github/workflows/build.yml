@@ -8,70 +8,82 @@ on:
       - master
   pull_request:
 
-env:
-  PKG_CACHE_PATH: .pkg
-
 jobs:
 
   yamllint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: ibiqlik/action-yamllint@v3
+      - uses: actions/checkout@v7.0.1
+      - uses: ibiqlik/action-yamllint@2576378a8e339169678f9939646ee3ee325e845c # v3.1.1
         with:
           strict: true
 
-  pkg:
-    runs-on: ubuntu-latest
+  smoke-test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        node-version: [24, 25]
+        bun-version: [1.2.23, 1.3.10]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          cache: 'npm'
-      - uses: actions/cache@v4
+          bun-version: ${{ matrix.bun-version }}
+      - uses: actions/setup-node@v7
         with:
-          path: ${{ env.PKG_CACHE_PATH }}
-          key: pkg-cache-${{ matrix.node-version }}
-      - run: npm ci
-      - run: npm run build
-      - run: npm run pkg-linux
-      - run: node src/index.js --version
-      - run: bin/linux/gitlab-ci-local --version
-      - run: bin/linux/gitlab-ci-local --help
+          node-version: ${{ matrix.node-version }}
+      - run: bun install --frozen-lockfile
+      - run: bun run build:linux-amd64
+      - run: bin/linux-amd64/gitlab-ci-local --version
+      - run: bin/linux-amd64/gitlab-ci-local --help
+      - run: bun run build:node
+      - run: node dist/index.js --version
+      - run: node dist/index.js --help
+      - run: head -1 dist/index.js | grep -q '#!/usr/bin/env node'
+
+  typecheck:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck
 
   eslint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          cache: 'npm'
-      - run: npm ci
-      - run: npm run lint
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bun run lint
 
   unused-deps:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7.0.1
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          cache: 'npm'
-      - run: npm ci
-      - run: npx depcheck --ignores depcheck
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
+      - run: bunx depcheck --ignores depcheck,@types/bun,@types/bun-types,vitest,@vitest/coverage-v8
 
-  jest:
-    runs-on: ubuntu-latest
+  test:
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@v4
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          cache: 'npm'
-      - run: npm ci
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile
       - name: Run Tests
-        run: FORCE_COLOR=1 npx jest --coverage --testTimeout 90000 --verbose
-      - uses: sonarsource/sonarcloud-github-action@v2.1
+        run: bun run coverage
+      - uses: sonarsource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -79,23 +91,23 @@ jobs:
 
   code-ql:
     name: CodeQL
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       actions: read
       contents: read
       security-events: write
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v7.0.1
 
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v3
-      with:
-        languages: 'typescript'
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4.39.1
+        with:
+          languages: 'typescript'
 
-    - name: Autobuild
-      uses: github/codeql-action/autobuild@v3
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v4.39.1
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v3
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4.39.1

@@ -15,6 +15,21 @@ deploy-stage-job:
     - echo ${CI_ENVIRONMENT_SLUG}
     - echo ${CI_ENVIRONMENT_NAME}
     - echo ${CI_ENVIRONMENT_URL}
+    - echo ${CI_ENVIRONMENT_ACTION}
+    - echo ${CI_ENVIRONMENT_TIER}
   environment:
     name: Stage Domain
     url: http://stage.domain.com
+    action: stop
+    deployment_tier: production
+
+deploy-stage-job-with-expansion:
+  stage: deploy
+  script:
+    - echo "Deploy stage something with expansion"
+    - echo ${CI_ENVIRONMENT_SLUG}
+    - echo ${CI_ENVIRONMENT_NAME}
+  variables:
+    EXPAND_ME: foobar-long-string
+  environment:
+    name: stage-domain-${EXPAND_ME}

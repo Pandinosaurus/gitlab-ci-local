@@ -1,19 +1,27 @@
-import chalk from "chalk";
+import chalk from "chalk-template";
 import * as dotenv from "dotenv";
-import * as fs from "fs-extra";
-import prettyHrtime from "pretty-hrtime";
-import split2 from "split2";
-import {Utils} from "./utils";
-import {WriteStreams} from "./write-streams";
-import {GitData} from "./git-data";
-import assert, {AssertionError} from "assert";
-import {Mutex} from "./mutex";
-import {Argv} from "./argv";
-import execa from "execa";
-import {CICDVariable} from "./variables-from-files";
-import {GitlabRunnerCPUsPresetValue, GitlabRunnerMemoryPresetValue, GitlabRunnerPresetValues} from "./gitlab-preset";
+import fs from "fs-extra";
+import {Readable} from "node:stream";
+import {StringDecoder} from "node:string_decoder";
+import {Utils} from "./utils.js";
+import {WriteStreams} from "./write-streams.js";
+import {GitData} from "./git-data.js";
+import assert, {AssertionError} from "node:assert";
+import {Mutex} from "./mutex.js";
+import {Argv} from "./argv.js";
+import {execa} from "execa";
+import {CICDVariable} from "./variables-from-files.js";
+import {GitlabRunnerCPUsPresetValue, GitlabRunnerMemoryPresetValue, GitlabRunnerPresetValues} from "./gitlab-preset.js";
+import {handler} from "./handler.js";
+import * as yaml from "js-yaml";
+import {Parser} from "./parser.js";
+import {resolveIncludeLocal, validateIncludeLocal} from "./parser-includes.js";
+import {globbySync} from "globby";
+import terminalLink from "terminal-link";
+import * as crypto from "node:crypto";
+import * as path from "node:path";
 
-const CI_PROJECT_DIR = "/gcl-builds";
+const GCL_SHELL_PROMPT_PLACEHOLDER = "<gclShellPromptPlaceholder>";
 interface JobOptions {
     argv: Argv;
     writeStreams: WriteStreams;
@@ -38,7 +46,7 @@ interface Cache {
     when: "on_success" | "on_failure" | "always";
 }
 
-interface Service {
+export interface Service {
     name: string;
     entrypoint: string[] | null;
     command: string[] | null;
@@ -53,7 +61,10 @@ export interface Need {
     ref?: string;
     pipeline?: string;
     project?: string;
+    parallel?: {matrix: {[key: string]: string | number | (string | number)[]}[]};
 }
+
+const isGlob = (str: string) => /[*?{}(|)[\]]/.test(str);
 
 const dateFormatter = new Intl.DateTimeFormat(undefined, {
     year: undefined,
@@ -64,27 +75,35 @@ const dateFormatter = new Intl.DateTimeFormat(undefined, {
     hour12: false,
 });
 
+export type JobRule = {
+    if?: string;
+    when?: string;
+    changes?: string[] | {paths: string[]};
+    exists?: string[] | {paths: string[]};
+    allow_failure?: boolean;
+    variables?: {[name: string]: string};
+    needs?: any[];
+};
+
 export class Job {
+    private generateJobId (): number {
+        return Math.floor(Math.random() * 1000000);
+    }
 
     static readonly illegalJobNames = new Set([
         "include", "local_configuration", "image", "services",
-        "stages", "types", "before_script", "default",
-        "after_script", "variables", "cache", "workflow",
+        "stages", "before_script", "default",
+        "after_script", "variables", "cache", "workflow", "page:deploy",
     ]);
 
     readonly argv: Argv;
     readonly name: string;
     readonly baseName: string;
+    readonly matrixVariables: {[key: string]: string} | null;
     readonly dependencies: string[] | null;
-    readonly environment?: {name: string; url: string | null};
+    readonly environment?: {name: string; url: string | null; deployment_tier: string | null; action: string | null};
     readonly jobId: number;
-    readonly rules?: {
-        if: string;
-        when: string;
-        exists: string[];
-        allow_failure: boolean;
-        variables: {[key: string]: string};
-    }[];
+    readonly rules?: JobRule[];
 
     readonly allowFailure: boolean | {
         exit_codes: number | number[];
@@ -93,8 +112,10 @@ export class Job {
     readonly exists: string[];
     readonly pipelineIid: number;
     readonly gitData: GitData;
+    readonly inherit: {
+        variables?: boolean | string[];
+    };
 
-    private readonly _variables: {[key: string]: string} = {};
     private _dotenvVariables: {[key: string]: string} = {};
     private _prescriptsExitCode: number | null = null;
     private _afterScriptsExitCode = 0;
@@ -102,30 +123,28 @@ export class Job {
     private _running = false;
     private _containerId: string | null = null;
     private _serviceNetworkId: string | null = null;
-    private _containerVolumeNames: string[] = [];
     private _longRunningSilentTimeout: NodeJS.Timeout = -1 as any;
     private _producers: {name: string; dotenv: string | null}[] | null = null;
     private _jobNamePad: number | null = null;
-
-    private _containersToClean: string[] = [];
-    private _filesToRm: string[] = [];
+    private _ciProjectDir: string | null = null;
     private _startTime?: [number, number];
     private _endTime?: [number, number];
 
+    private readonly _filesToRm: string[] = [];
+    private readonly _globalVariables: {[key: string]: string} = {};
+    private readonly _variables: {[key: string]: string} = {};
+    private readonly _containersToClean: string[] = [];
+    private readonly _containerVolumeNames: string[] = [];
     private readonly jobData: any;
     private readonly writeStreams: WriteStreams;
 
     constructor (opt: JobOptions) {
         const jobData = opt.data;
-        const gitData = opt.gitData;
         const jobVariables = jobData.variables ?? {};
-        const globalVariables = opt.globalVariables ?? {};
         const variablesFromFiles = opt.variablesFromFiles;
         const argv = opt.argv;
         const cwd = argv.cwd;
-        const stateDir = argv.stateDir;
         const argvVariables = argv.variable;
-        const predefinedVariables = opt.predefinedVariables;
         const expandVariables = opt.expandVariables ?? true;
 
         this.argv = argv;
@@ -133,70 +152,101 @@ export class Job {
         this.gitData = opt.gitData;
         this.name = opt.name;
         this.baseName = opt.baseName;
-        this.jobId = Math.floor(Math.random() * 1000000);
+        this.matrixVariables = opt.matrixVariables;
+        this.jobId = this.generateJobId();
         this.jobData = opt.data;
         this.pipelineIid = opt.pipelineIid;
+        this._globalVariables = opt.globalVariables;
+
+        this.inherit = {};
+        this.inherit.variables = this.jobData.inherit?.variables ?? true;
 
         this.when = jobData.when || "on_success";
         this.exists = jobData.exists || [];
         this.allowFailure = jobData.allow_failure ?? false;
         this.dependencies = jobData.dependencies || null;
         this.rules = jobData.rules || null;
-        this.environment = typeof jobData.environment === "string" ? {name: jobData.environment} : jobData.environment;
-
-        // Set FF_DISABLE_UMASK_FOR_DOCKER_EXECUTOR
-        globalVariables["FF_DISABLE_UMASK_FOR_DOCKER_EXECUTOR"] = argv.umask ? "false" : "true";
+        if (typeof jobData.environment === "string") {
+            this.environment = {name: jobData.environment, url: null, deployment_tier: null, action: null};
+        } else if (jobData.environment) {
+            this.environment = {...jobData.environment};
+        } else {
+            this.environment = jobData.environment;
+        }
 
         const matrixVariables = opt.matrixVariables ?? {};
-        this._variables = {...globalVariables, ...jobVariables, ...matrixVariables, ...predefinedVariables, ...argvVariables};
+        const fileVariables = Utils.findEnvMatchedVariables(variablesFromFiles, this.fileVariablesDir);
+        const predefinedVariables = this._predefinedVariables(opt);
+        this._variables = {...predefinedVariables, ...this.globalVariables, ...jobVariables, ...matrixVariables, ...fileVariables, ...argvVariables};
 
-        let ciProjectDir = `${cwd}`;
-        if (this.jobData["image"]) {
-            ciProjectDir = CI_PROJECT_DIR;
-        } else if (argv.shellIsolation) {
-            ciProjectDir = `${cwd}/${stateDir}/builds/${this.safeJobName}`;
+        if (this.rules && expandVariables) {
+            const expanded = Utils.expandVariables(this._variables);
+
+            // Expand variables in rules:changes
+            this.rules.forEach((rule, ruleIdx, rules) => {
+                const changes = Array.isArray(rule.changes) ? rule.changes : rule.changes?.paths;
+                if (!changes) {
+                    return;
+                }
+
+                changes.forEach((change, changeIdx, changes) => {
+                    changes[changeIdx] = Utils.expandText(change, expanded);
+                });
+                rules[ruleIdx].changes = changes;
+            });
+
+            // Expand variables in rules:exists
+            this.rules.forEach((rule) => {
+                // The object form shares this array with rule.exists.paths, so
+                // expanding in place is enough and leaves project/ref alone.
+                const exists = Array.isArray(rule.exists) ? rule.exists : rule.exists?.paths;
+                if (!exists) {
+                    return;
+                }
+                exists.forEach((exist, existId, exists) => {
+                    exists[existId] = Utils.expandText(exist, expanded);
+                });
+            });
         }
 
-        predefinedVariables["CI_JOB_ID"] = `${this.jobId}`;
-        predefinedVariables["CI_PIPELINE_ID"] = `${this.pipelineIid + 1000}`;
-        predefinedVariables["CI_PIPELINE_IID"] = `${this.pipelineIid}`;
-        predefinedVariables["CI_JOB_NAME"] = `${this.name}`;
-        predefinedVariables["CI_JOB_NAME_SLUG"] = `${this.name.replace(/[^a-z\d]+/ig, "-").replace(/^-/, "").slice(0, 63).replace(/-$/, "").toLowerCase()}`;
-        predefinedVariables["CI_JOB_STAGE"] = `${this.stage}`;
-        predefinedVariables["CI_PROJECT_DIR"] = ciProjectDir;
-        predefinedVariables["CI_JOB_URL"] = `https://${gitData.remote.host}/${gitData.remote.group}/${gitData.remote.project}/-/jobs/${this.jobId}`; // Changes on rerun.
-        predefinedVariables["CI_PIPELINE_URL"] = `https://${gitData.remote.host}/${gitData.remote.group}/${gitData.remote.project}/pipelines/${this.pipelineIid}`;
-        predefinedVariables["CI_ENVIRONMENT_NAME"] = this.environment?.name ?? "";
-        predefinedVariables["CI_ENVIRONMENT_SLUG"] = this.environment?.name?.replace(/[^a-z\d]+/ig, "-").replace(/^-/, "").slice(0, 23).replace(/-$/, "").toLowerCase() ?? "";
-        predefinedVariables["CI_ENVIRONMENT_URL"] = this.environment?.url ?? "";
-        if (opt.nodeIndex !== null) {
-            predefinedVariables["CI_NODE_INDEX"] = `${opt.nodeIndex}`;
+        let ruleVariables: {[name: string]: string} | undefined;
+        // Set {when, allowFailure} based on rules result
+        if (this.rules) {
+            const ruleResult = Utils.getRulesResult({argv, cwd, rules: this.rules, variables: this._variables}, this.gitData, this.when, jobData.allow_failure);
+            this.when = ruleResult.when;
+            this.allowFailure = ruleResult.allowFailure;
+            ruleVariables = ruleResult.variables;
+            if (ruleResult.needs) {
+                this.jobData["needs"] = ruleResult.needs;
+            }
+            this._variables = {...this._variables, ...ruleVariables, ...argvVariables};
         }
-        predefinedVariables["CI_NODE_TOTAL"] = `${opt.nodesTotal}`;
-        predefinedVariables["CI_REGISTRY"] = `local-registry.${this.gitData.remote.host}`;
-        predefinedVariables["CI_REGISTRY_IMAGE"] = `$CI_REGISTRY/${this._variables["CI_PROJECT_PATH"].toLowerCase()}`;
 
         // Find environment matched variables
         if (this.environment && expandVariables) {
             const expanded = Utils.expandVariables(this._variables);
+            const envNameBeforeExpansion = this.environment.name;
             this.environment.name = Utils.expandText(this.environment.name, expanded);
+            if (this.environment.name !== envNameBeforeExpansion) {
+                // Regenerate CI_ENVIRONMENT_SLUG based on env name if it changed after expansion
+                predefinedVariables["CI_ENVIRONMENT_SLUG"] = this._generateEnvironmentSlug(this.environment.name);
+            }
             this.environment.url = Utils.expandText(this.environment.url, expanded);
         }
         const envMatchedVariables = Utils.findEnvMatchedVariables(variablesFromFiles, this.fileVariablesDir, this.environment);
 
-        // Merge and expand after finding env matched variables
-        this._variables = {...globalVariables, ...jobVariables, ...matrixVariables, ...predefinedVariables, ...envMatchedVariables, ...argvVariables};
+        const userDefinedVariables = {...this.globalVariables, ...jobVariables, ...matrixVariables, ...ruleVariables, ...envMatchedVariables, ...argvVariables};
+        this.discourageOverridingOfPredefinedVariables(predefinedVariables, userDefinedVariables, argv.ignorePredefinedVars);
 
-        // Set {when, allowFailure} based on rules result
-        if (this.rules) {
-            const ruleResult = Utils.getRulesResult({cwd, rules: this.rules, variables: this._variables}, this.gitData, this.when);
-            this.when = ruleResult.when;
-            this.allowFailure = ruleResult.allowFailure;
-            this._variables = {...globalVariables, ...jobVariables, ...ruleResult.variables, ...matrixVariables, ...predefinedVariables, ...envMatchedVariables, ...argvVariables};
-        }
+        // Merge and expand after finding env matched variables
+        this._variables = {...predefinedVariables, ...userDefinedVariables};
         // Delete variables the user intentionally wants unset
         for (const unsetVariable of argv.unsetVariables) {
             delete this._variables[unsetVariable];
+        }
+        // Set GCL_PROJECT_DIR_ON_HOST if docker image
+        if (this.imageName(this._variables)) {
+            this._variables = {...this._variables, GCL_PROJECT_DIR_ON_HOST: cwd};
         }
 
         assert(this.scripts || this.trigger, chalk`{blueBright ${this.name}} must have script specified`);
@@ -237,6 +287,128 @@ export class Job {
         }
     }
 
+    /**
+     *  Warn when overriding of predefined variables is detected
+     */
+    private discourageOverridingOfPredefinedVariables (predefinedVariables: {[name: string]: string}, userDefinedVariables: {[name: string]: string}, whiteListedPredefinedVariablesKeys: string[]) {
+        const predefinedVariablesKeys = Object.keys(predefinedVariables);
+        const userDefinedVariablesKeys = Object.keys(userDefinedVariables);
+
+        const overridingOfPredefinedVariables = userDefinedVariablesKeys.filter(ele => predefinedVariablesKeys.includes(ele) && !whiteListedPredefinedVariablesKeys.includes(ele));
+        if (overridingOfPredefinedVariables.length == 0) {
+            return;
+        }
+
+        const linkToGitlab = "https://gitlab.com/gitlab-org/gitlab/-/blob/v17.7.1-ee/doc/ci/variables/predefined_variables.md?plain=1&ref_type=tags#L15-16";
+        this.writeStreams.memoStdout(chalk`
+{bgYellowBright  WARN } ${terminalLink("Avoid overriding predefined variables", linkToGitlab)} [{bold ${overridingOfPredefinedVariables}}] as it can cause the pipeline to behave unexpectedly.
+If you know what you're doing and would like to suppress this warning, use one of the following methods:
+\t• via cli options
+\t\t• --ignore-predefined-vars ${overridingOfPredefinedVariables}
+\t• via environment variable
+\t\t• GCL_IGNORE_PREDEFINED_VARS=${overridingOfPredefinedVariables}
+`);
+    }
+
+    /**
+     * Get the predefinedVariables that's enriched with the additional info that's only available when constructing
+     */
+    private _predefinedVariables (opt: JobOptions) {
+        const argv = this.argv;
+        const cwd = argv.cwd;
+        const stateDir = this.argv.stateDir;
+        const gitData = this.gitData;
+
+        let ciBuildsDir: string;
+        if (this.jobData["image"]) {
+            ciBuildsDir = "/builds";
+            this.ciProjectDir = `${ciBuildsDir}/${gitData.remote.group}/${gitData.remote.project}`;
+        } else if (argv.shellIsolation) {
+            ciBuildsDir = `${cwd}/${stateDir}/builds/${this.safeJobName}`;
+            this.ciProjectDir = ciBuildsDir;
+        } else {
+            ciBuildsDir = cwd;
+            this.ciProjectDir = ciBuildsDir;
+        }
+
+        const predefinedVariables = opt.predefinedVariables;
+
+        predefinedVariables["CI_JOB_ID"] = `${this.jobId}`;
+        predefinedVariables["CI_PIPELINE_ID"] = `${this.pipelineIid + 1000}`;
+        predefinedVariables["CI_PIPELINE_IID"] = `${this.pipelineIid}`;
+        predefinedVariables["CI_JOB_NAME"] = `${this.name}`;
+        predefinedVariables["CI_JOB_NAME_SLUG"] = `${this.name.replaceAll(/[^a-z\d]+/ig, "-").replace(/^-/, "").slice(0, 63).replace(/-$/, "").toLowerCase()}`;
+        predefinedVariables["CI_JOB_STAGE"] = `${this.stage}`;
+        predefinedVariables["CI_BUILDS_DIR"] = ciBuildsDir;
+        predefinedVariables["CI_PROJECT_DIR"] = this.ciProjectDir;
+        predefinedVariables["CI_JOB_URL"] = `${predefinedVariables["CI_SERVER_URL"]}/${gitData.remote.group}/${gitData.remote.project}/-/jobs/${this.jobId}`; // Changes on rerun.
+        predefinedVariables["CI_PIPELINE_URL"] = `${predefinedVariables["CI_SERVER_URL"]}/${gitData.remote.group}/${gitData.remote.project}/pipelines/${this.pipelineIid}`;
+        predefinedVariables["CI_ENVIRONMENT_NAME"] = this.environment?.name ?? "";
+        predefinedVariables["CI_ENVIRONMENT_SLUG"] = this.environment?.name ? this._generateEnvironmentSlug(this.environment.name) : "";
+        predefinedVariables["CI_ENVIRONMENT_URL"] = this.environment?.url ?? "";
+        predefinedVariables["CI_ENVIRONMENT_TIER"] = this.environment?.deployment_tier ?? "";
+        predefinedVariables["CI_ENVIRONMENT_ACTION"] = this.environment?.action ?? "";
+
+        if (opt.nodeIndex !== null) {
+            predefinedVariables["CI_NODE_INDEX"] = `${opt.nodeIndex}`;
+        }
+        predefinedVariables["CI_NODE_TOTAL"] = `${opt.nodesTotal}`;
+        predefinedVariables["CI_REGISTRY"] = predefinedVariables["CI_REGISTRY"] = this.argv.registry ? Utils.gclRegistryPrefix : `local-registry.${this.gitData.remote.host}`;
+        predefinedVariables["CI_REGISTRY_IMAGE"] = `$CI_REGISTRY/${predefinedVariables["CI_PROJECT_PATH"].toLowerCase()}`;
+        return predefinedVariables;
+    }
+
+    /**
+     * Generates a compliant slug for an environment name.
+     * See: https://gitlab.com/gitlab-org/gitlab/-/blob/fc31e7ac344e53ebae182ea1dca183bdc0e2ea71/lib/gitlab/slug/environment.rb
+     *
+     * The slug:
+     * - Contains only lowercase letters (a-z), numbers (0-9), and '-'.
+     * - Begins with a letter.
+     * - Has a maximum length of 24 characters.
+     * - Does not end with '-'.
+     *
+     * @param name The original environment name.
+     * @returns A compliant environment slug.
+     */
+    private _generateEnvironmentSlug (name: string): string {
+        // 1. Lowercase, replace non-alphanumeric with '-', and squeeze repeating '-'
+        let slug = name
+            .toLowerCase()
+            .replaceAll(/[^a-z0-9]/g, "-")
+            .replaceAll(/-+/g, "-");
+
+        // 2. Must start with a letter
+        if (!/^[a-z]/.test(slug)) {
+            slug = `env-${slug}`;
+        }
+
+        // 3. If it's too long or was modified, shorten and add a hash suffix
+        if (slug.length > 24 || slug !== name) {
+            // Truncate to 17 chars (leaving room for '-' + 6-char hash)
+            slug = slug.slice(0, 17);
+
+            // Ensure it ends with a dash before adding the suffix
+            if (!slug.endsWith("-")) {
+                slug += "-";
+            }
+
+            // Create the 6-char suffix from a hash of the *original* name
+            const hexHash = crypto
+                .createHash("sha256")
+                .update(name)
+                .digest("hex");
+
+            // Use BigInt for safe conversion from hex -> base36
+            const suffix = BigInt(`0x${hexHash}`).toString(36).slice(-6);
+
+            return slug + suffix;
+        }
+
+        // 4. If it was short and unmodified, just ensure it doesn't end with '-'
+        return slug.replace(/-$/, "");
+    }
+
     get jobStatus () {
         if (this.preScriptsExitCode == null) return "pending";
         if (this.preScriptsExitCode == 0) return "success";
@@ -250,10 +422,10 @@ export class Job {
                 }
                 break;
             case "object":
-                if (! Array.isArray(allowFailure.exit_codes)) {
-                    allowedExitCodes = [allowFailure.exit_codes];
-                } else {
+                if (Array.isArray(allowFailure.exit_codes)) {
                     allowedExitCodes = allowFailure.exit_codes;
+                } else {
+                    allowedExitCodes = [allowFailure.exit_codes];
                 }
                 break;
             default:
@@ -270,21 +442,23 @@ export class Job {
 
     get prettyDuration () {
         if (this._endTime) {
-            return prettyHrtime(this._endTime);
+            return Utils.prettyHrtime(this._endTime);
         }
 
-        return this._startTime
-            ? prettyHrtime(process.hrtime(this._startTime))
-            : "0 ms";
+        return this._startTime ?
+            Utils.prettyHrtime(process.hrtime(this._startTime)) :
+            "0 ms";
     }
 
     get formattedJobName () {
-        const timestampPrefix = this.argv.showTimestamps
-            ? `[${dateFormatter.format(new Date())} ${this.prettyDuration.padStart(7)}] `
-            : "";
+        let prefix = "";
+        if (this.argv.childPipelineDepth > 0) prefix = "\t".repeat(this.argv.childPipelineDepth) + `[${this.argv.variable.GCL_TRIGGERER}] -> `;
+        const timestampPrefix = this.argv.showTimestamps ?
+            `[${dateFormatter.format(new Date())} ${this.prettyDuration.padStart(7)}] ` :
+            "";
 
         // [16:33:19 1.37 min] my-job     > hello world
-        return chalk`${timestampPrefix}{blueBright ${this.name.padEnd(this.jobNamePad)}}`;
+        return chalk`${timestampPrefix}{blueBright ${prefix}${this.name.padEnd(this.jobNamePad)}}`;
     }
 
     get safeJobName () {
@@ -293,6 +467,10 @@ export class Job {
 
     get needs (): Need[] | null {
         return this.jobData["needs"] ?? null;
+    }
+
+    get certVolumeName (): string {
+        return `gcl-${this.safeJobName}-${this.jobId}-cert`;
     }
 
     get buildVolumeName (): string {
@@ -310,6 +488,7 @@ export class Job {
         for (const service of Object.values<any>(this.jobData["services"])) {
             const expanded = Utils.expandVariables({...this._variables, ...this._dotenvVariables, ...service["variables"]});
             let serviceName = Utils.expandText(service["name"], expanded);
+            if (serviceName == "") continue;
             serviceName = serviceName.includes(":") ? serviceName : `${serviceName}:latest`;
             services.push({
                 name: serviceName,
@@ -320,6 +499,15 @@ export class Job {
             });
         }
         return services;
+    }
+
+    set ciProjectDir (ciProjectDir: string) {
+        assert(this._ciProjectDir == null, "this._ciProjectDir can only be set once");
+        this._ciProjectDir = ciProjectDir;
+    }
+    get ciProjectDir () {
+        assert(this._ciProjectDir, "attempted to access this._ciProjectDir before it is initialized");
+        return this._ciProjectDir;
     }
 
     set jobNamePad (jobNamePad: number) {
@@ -360,24 +548,42 @@ export class Job {
         return this.jobData["artifacts"];
     }
 
+    deleteArtifacts () {
+        delete this.jobData["artifacts"];
+    }
+
     get cache (): Cache[] {
         return this.jobData["cache"] || [];
     }
 
-    public async getUniqueCacheName (cwd: string, expanded: {[key: string]: string}, key: any) {
+    public async getUniqueCacheName (cwd: string, expanded: {[key: string]: string}, cacheIndex: number) {
+        const getCachePrefix = (index: number) => {
+            const prefix = this.jobData["cache"][index]["key"]["prefix"];
+            if (prefix) {
+                return `${index}_${Utils.expandText(prefix, expanded)}-`;
+            }
+
+            const filenames = this.jobData["cache"][index]["key"]["files"].map((p: string) => {
+                const expandP = Utils.expandText(p, expanded);
+                return expandP.split(".")[0];
+            }).join("_");
+            return `${index}_${filenames}-`;
+        };
+
+        const key = this.jobData["cache"][cacheIndex].key;
+
         if (typeof key === "string" || key == null) {
             return Utils.expandText(key ?? "default", expanded);
         }
 
         const files = key["files"].map((f: string) => {
             let path = Utils.expandText(f, expanded);
-            if (path.startsWith(`${CI_PROJECT_DIR}/`)) {
-                path = path.slice(`${CI_PROJECT_DIR}/`.length);
+            if (path.startsWith(`${this.ciProjectDir}/`)) {
+                path = path.slice(`${this.ciProjectDir}/`.length);
             }
             return `${cwd}/${path}`;
         });
-
-        return "md-" + await Utils.checksumFiles(files);
+        return getCachePrefix(cacheIndex) + await Utils.checksumFiles(cwd, files);
     }
 
     get beforeScripts (): string[] {
@@ -397,6 +603,25 @@ export class Job {
 
     get trigger (): any {
         return this.jobData["trigger"];
+    }
+
+    async startTriggerPipeline () {
+        this.writeStreams.memoStdout(chalk`{bgYellowBright  WARN } downstream pipeline is experimental in gitlab-ci-local\n`);
+        await this.fetchTriggerInclude();
+        const expandedVariables = Utils.expandVariables(this._variables);
+        const variablesForDownstreamPipeline = Object.keys({...this.globalVariables, ...this.jobData.variables}).map((key) => `${key}=${expandedVariables[key] ?? ""}`);
+
+        const gclTriggerer = this.argv.variable["GCL_TRIGGERER"] ?
+            `${this.argv.variable["GCL_TRIGGERER"]} -> ${this.name}` :
+            this.name;
+        await handler({
+            ...Object.fromEntries(this.argv.map),
+            file: `${this.argv.stateDir}/includes/triggers/${this.name}.yml`,
+            variable: [
+                chalk`GCL_TRIGGERER=${gclTriggerer}`,
+                "CI_PIPELINE_SOURCE=parent_pipeline",
+            ].concat(variablesForDownstreamPipeline),
+        }, this.writeStreams, [], this.argv.childPipelineDepth + 1);
     }
 
     get preScriptsExitCode () {
@@ -423,15 +648,36 @@ export class Job {
         return `/tmp/gitlab-ci-local-file-variables-${this._variables["CI_PROJECT_PATH_SLUG"]}-${this.jobId}`;
     }
 
+    get globalVariables () {
+        if (this.inherit.variables === false) {
+            return {};
+        } else if (Array.isArray(this.inherit.variables)) {
+            const inheritVariables = this.inherit.variables;
+            return Object.fromEntries(
+                Object.entries(this._globalVariables).filter(([k]) => inheritVariables.includes(k)),
+            );
+        }
+        return this._globalVariables;
+    }
+
     async start (): Promise<void> {
+        if (this.trigger) {
+            await this.startTriggerPipeline();
+            this._prescriptsExitCode = 0; // NOTE: so that `this.finished` will implicitly be set to true
+            return;
+        }
+
         this._running = true;
 
         const argv = this.argv;
         this._startTime = process.hrtime();
+        this._variables["CI_JOB_STARTED_AT"] = new Date().toISOString().split(".")[0] + "Z";
         const writeStreams = this.writeStreams;
         this._dotenvVariables = await this.initProducerReportsDotenvVariables(writeStreams, Utils.expandVariables(this._variables));
         const expanded = Utils.unscape$$Variables(Utils.expandVariables({...this._variables, ...this._dotenvVariables}));
         const imageName = this.imageName(expanded);
+        const imagePlatform = this.imagePlatform(expanded);
+        const helperImageName = argv.helperImage;
         const safeJobName = this.safeJobName;
 
         const outputLogFilePath = `${argv.cwd}/${argv.stateDir}/output/${safeJobName}.log`;
@@ -443,46 +689,76 @@ export class Job {
         }
 
         if (imageName) {
+            await this.pullImage(writeStreams, imageName, imagePlatform);
+
             const buildVolumeName = this.buildVolumeName;
             const tmpVolumeName = this.tmpVolumeName;
             const fileVariablesDir = this.fileVariablesDir;
 
-            const volumePromises = [];
-            volumePromises.push(Utils.spawn([this.argv.containerExecutable, "volume", "create", `${buildVolumeName}`], argv.cwd));
-            volumePromises.push(Utils.spawn([this.argv.containerExecutable, "volume", "create", `${tmpVolumeName}`], argv.cwd));
-            this._containerVolumeNames.push(buildVolumeName);
-            this._containerVolumeNames.push(tmpVolumeName);
-            await Promise.all(volumePromises);
+            this._containerVolumeNames.push(buildVolumeName, tmpVolumeName);
+            const volumeCreatePromises = [
+                Utils.spawn([this.argv.containerExecutable, "volume", "create", `${buildVolumeName}`], argv.cwd),
+                Utils.spawn([this.argv.containerExecutable, "volume", "create", `${tmpVolumeName}`], argv.cwd),
+            ];
+            if (this.argv.volume.some(v => v.startsWith("%gcl-cert%:"))) {
+                this._containerVolumeNames.push(this.certVolumeName);
+                volumeCreatePromises.push(Utils.spawn([this.argv.containerExecutable, "volume", "create", this.certVolumeName], argv.cwd));
+            }
+            await Promise.all(volumeCreatePromises);
 
             const time = process.hrtime();
             this.refreshLongRunningSilentTimeout(writeStreams);
 
             let chownOpt = "0:0";
             let chmodOpt = "a+rw";
-            if (expanded["FF_DISABLE_UMASK_FOR_DOCKER_EXECUTOR"] === "true") {
-                const {stdout} = await Utils.spawn(["docker", "run", "--rm", imageName, "sh", "-c", "echo \"$(id -u):$(id -g)\""]);
+            if (!this.argv.umask) {
+                const {stdout} = await Utils.spawn([this.argv.containerExecutable, "run", "--rm", "--entrypoint", "sh", imageName, "-c", "echo \"$(id -u):$(id -g)\""]);
                 chownOpt = stdout;
                 if (chownOpt == "0:0") {
                     chmodOpt = "g-w";
                 }
             }
-            const {stdout: containerId} = await Utils.spawn([
-                this.argv.containerExecutable, "create", "--user=0:0", `--volume=${buildVolumeName}:/gcl-builds`, `--volume=${tmpVolumeName}:${this.fileVariablesDir}`, "docker.io/firecow/gitlab-ci-local-util",
-                ...["sh", "-c", `chown ${chownOpt} -R /gcl-builds/ && chmod ${chmodOpt} -R /gcl-builds/ && chown ${chownOpt} -R /tmp/ && chmod ${chmodOpt} -R /tmp/`],
-            ], argv.cwd);
+            if (helperImageName) {
+                await this.pullImage(writeStreams, helperImageName);
+            }
+
+            const helperContainerArgs = [
+                this.argv.containerExecutable, "create", "--user=0:0",
+                `--volume=${buildVolumeName}:${this.ciProjectDir}`,
+                `--volume=${tmpVolumeName}:${this.fileVariablesDir}`,
+            ];
+
+            if (this.argv.caFile) {
+                const caFilePath = path.isAbsolute(this.argv.caFile) ? this.argv.caFile : path.resolve(this.argv.cwd, this.argv.caFile);
+                if (await fs.pathExists(caFilePath)) {
+                    helperContainerArgs.push(`--volume=${caFilePath}:/etc/ssl/certs/ca-certificates.crt:ro`);
+                }
+            }
+
+            helperContainerArgs.push(`${helperImageName}`, "sh", "-c", `chown ${chownOpt} -R ${this.ciProjectDir} && chmod ${chmodOpt} -R ${this.ciProjectDir} && chown ${chownOpt} -R /tmp/ && chmod ${chmodOpt} -R /tmp/`);
+
+            const {stdout: containerId} = await Utils.spawn(helperContainerArgs, argv.cwd);
             this._containersToClean.push(containerId);
             if (await fs.pathExists(fileVariablesDir)) {
                 await Utils.spawn([this.argv.containerExecutable, "cp", `${fileVariablesDir}/.`, `${containerId}:${fileVariablesDir}`], argv.cwd);
                 this.refreshLongRunningSilentTimeout(writeStreams);
             }
-            await Utils.spawn([this.argv.containerExecutable, "cp", `${argv.stateDir}/builds/.docker/.`, `${containerId}:/gcl-builds`], argv.cwd);
+            await Utils.spawn([this.argv.containerExecutable, "cp", `${argv.stateDir}/builds/.docker/.`, `${containerId}:${this.ciProjectDir}`], argv.cwd);
             await Utils.spawn([this.argv.containerExecutable, "start", "--attach", containerId], argv.cwd);
             await Utils.spawn([this.argv.containerExecutable, "rm", "-vf", containerId], argv.cwd);
             const endTime = process.hrtime(time);
-            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright copied to docker volumes} in {magenta ${prettyHrtime(endTime)}}\n`);
+            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright copied to ${this.argv.containerExecutable} volumes} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
         }
 
         if (this.services?.length) {
+            // `host` and `none` networks do not work with services because aliases only work for
+            // user defined networks.
+            for (const network of this.argv.network) {
+                if (["host", "none"].includes(network)) {
+                    throw new AssertionError({message: `Cannot add service network alias with network mode '${network}'`});
+                }
+            }
+
             await this.createDockerNetwork(`gitlab-ci-local-${this.jobId}`);
 
             await Promise.all(
@@ -495,12 +771,12 @@ export class Job {
                     const {stdout, stderr} = await Utils.spawn([this.argv.containerExecutable, "logs", serviceContainerId]);
                     await fs.ensureFile(serviceContainerLogFile);
                     await fs.promises.writeFile(serviceContainerLogFile, `### stdout ###\n${stdout}\n### stderr ###\n${stderr}\n`);
-                })
+                }),
             );
         }
 
         await this.execPreScripts(expanded);
-        if (this._prescriptsExitCode == null) throw Error("this._prescriptsExitCode must be defined!");
+        if (this._prescriptsExitCode == null) throw new Error("this._prescriptsExitCode must be defined!");
 
         await this.execAfterScripts(expanded);
 
@@ -514,19 +790,27 @@ export class Job {
         if (this.jobData["coverage"]) {
             this._coveragePercent = await Utils.getCoveragePercent(argv.cwd, argv.stateDir, this.jobData["coverage"], safeJobName);
         }
-
-        this.cleanupResources();
     }
+
+    private _cleanupPromise: Promise<void> | null = null;
 
     async cleanupResources () {
         clearTimeout(this._longRunningSilentTimeout);
 
         if (!this.argv.cleanup) return;
 
-        try {
-            await Utils.spawn([this.argv.containerExecutable, "rm", "-vf", ...this._containersToClean]);
-        } catch (e) {
-            assert(e instanceof Error, "e is not instanceof Error");
+        if (this._cleanupPromise) return this._cleanupPromise;
+        this._cleanupPromise = this._doCleanupResources();
+        return this._cleanupPromise;
+    }
+
+    private async _doCleanupResources () {
+        if (this._containersToClean.length > 0) {
+            try {
+                await Utils.spawn([this.argv.containerExecutable, "rm", "-vf", ...this._containersToClean]);
+            } catch (e) {
+                assert(e instanceof Error, "e is not instanceof Error");
+            }
         }
 
         if (this._serviceNetworkId) {
@@ -537,10 +821,12 @@ export class Job {
             }
         }
 
-        try {
-            await Utils.spawn([this.argv.containerExecutable, "volume", "rm", ...this._containerVolumeNames]);
-        } catch (e) {
-            assert(e instanceof Error, "e is not instanceof Error");
+        if (this._containerVolumeNames.length > 0) {
+            try {
+                await Utils.spawn([this.argv.containerExecutable, "volume", "rm", ...this._containerVolumeNames]);
+            } catch (e) {
+                assert(e instanceof Error, "e is not instanceof Error");
+            }
         }
 
         const rmPromises = [];
@@ -570,12 +856,15 @@ export class Job {
     private generateScriptCommands (scripts: string[]) {
         let cmd = "";
         scripts.forEach((script) => {
-            // Print command echo'ed in color
             const split = script.split(/\r?\n/);
             const multilineText = split.length > 1 ? " # collapsed multi-line command" : "";
-            const text = split[0]?.replace(/\\/g, "\\\\").replace(/"/g, "\\\"").replace(/[$]/g, "\\$");
-            cmd += chalk`echo "{green $ ${text}${multilineText}}"\n`;
-
+            const text = split[0]?.replaceAll("\\", String.raw`\\`).replaceAll("\"", String.raw`\"`).replaceAll("$", String.raw`\$`);
+            if (this.interactive) {
+                cmd += chalk`echo "{green $ ${text}${multilineText}}"\n`;
+            } else {
+                // Print command echo'ed with $GCL_SHELL_PROMPT_PLACEHOLDER
+                cmd += `echo "${GCL_SHELL_PROMPT_PLACEHOLDER} ${text}${multilineText}"\n`;
+            }
             // Execute actual script
             cmd += `${script}\n`;
         });
@@ -586,13 +875,14 @@ export class Job {
         if (this.imageName(expanded) && !this.argv.mountCache) return [];
 
         const cmd: string[] = [];
-        for (const c of this.cache) {
-            const uniqueCacheName = await this.getUniqueCacheName(this.argv.cwd, expanded, c.key);
+        const uniqueCacheNames = await Promise.all(this.cache.map((_, index) => this.getUniqueCacheName(this.argv.cwd, expanded, index)));
+        for (const [index, c] of this.cache.entries()) {
+            const uniqueCacheName = uniqueCacheNames[index];
             c.paths.forEach((p) => {
                 const path = Utils.expandText(p, expanded);
                 writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright mounting cache} for path ${path}\n`);
                 const cacheMount = Utils.safeDockerString(`gcl-${expanded.CI_PROJECT_PATH_SLUG}-${uniqueCacheName}`);
-                cmd.push("-v", `${cacheMount}:/gcl-builds/${path}`);
+                cmd.push("-v", `${cacheMount}:${this.ciProjectDir}/${path}`);
             });
         }
         return cmd;
@@ -629,41 +919,62 @@ export class Job {
 
         if (message.length > 0) writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright ${message}}\n`);
 
+        await fs.remove(`${cwd}/${stateDir}/artifacts/${safeJobName}`);
+
         // Copy git tracked files to build folder if shell isolation enabled.
         if (!imageName && this.argv.shellIsolation) {
-            await Utils.rsyncTrackedFiles(cwd, stateDir, `${safeJobName}`);
+            await Utils.rsyncTrackedFiles(cwd, stateDir, path.resolve(cwd, this.argv.ignoresFile), `${safeJobName}`);
         }
 
         if (this.interactive) {
-            const iCmd = this.generateScriptCommands(scripts);
+            let iCmd = "set -eo pipefail\n";
+            iCmd += this.generateScriptCommands(scripts);
+
             const interactiveCp = execa(iCmd, {
                 cwd,
                 shell: "bash",
                 stdio: ["inherit", "inherit", "inherit"],
                 env: {...expanded, ...process.env},
+                reject: false,
             });
+            const interactiveChildProcess = interactiveCp.nodeChildProcess;
             return new Promise<number>((resolve, reject) => {
-                void interactiveCp.on("exit", (code) => resolve(code ?? 0));
-                void interactiveCp.on("error", (err) => reject(err));
+                interactiveChildProcess.on("exit", (code) => resolve(code ?? 0));
+                interactiveChildProcess.on("error", (err) => reject(err));
             });
+        }
+
+        if (this.argv.registry) {
+            expanded["CI_REGISTRY_USER"] = expanded["CI_REGISTRY_USER"] ?? `${Utils.gclRegistryPrefix}.user`;
+            expanded["CI_REGISTRY_PASSWORD"] = expanded["CI_REGISTRY_PASSWORD"] ?? `${Utils.gclRegistryPrefix}.password`;
         }
 
         this.refreshLongRunningSilentTimeout(writeStreams);
 
-        if (imageName) {
-            await this.pullImage(writeStreams, imageName);
-
+        if (imageName && !this._containerId) {
             let dockerCmd = `${this.argv.containerExecutable} create --interactive ${this.generateInjectSSHAgentOptions()} `;
             if (this.argv.privileged) {
                 dockerCmd += "--privileged ";
+            }
+
+            for (const device of this.argv.device) {
+                dockerCmd += `--device ${device} `;
             }
 
             if (this.argv.ulimit !== null) {
                 dockerCmd += `--ulimit nofile=${this.argv.ulimit} `;
             }
 
-            if (expanded["FF_DISABLE_UMASK_FOR_DOCKER_EXECUTOR"] === "false") {
+            if (this.argv.umask) {
                 dockerCmd += "--user 0:0 ";
+            }
+
+            if (this.argv.userns != undefined) {
+                dockerCmd += `--userns=${this.argv.userns} `;
+            }
+
+            if (this.argv.shmSize != undefined) {
+                dockerCmd += `--shm-size=${this.argv.shmSize} `;
             }
 
             if (this.argv.containerMacAddress) {
@@ -673,6 +984,11 @@ export class Job {
             const imageUser = this.imageUser(expanded);
             if (imageUser) {
                 dockerCmd += `--user ${imageUser} `;
+            }
+
+            const imagePlatform = this.imagePlatform(expanded);
+            if (imagePlatform) {
+                dockerCmd += `--platform ${imagePlatform} `;
             }
 
             if (this.argv.containerEmulate) {
@@ -690,37 +1006,72 @@ export class Job {
                 dockerCmd += `--cpus=${cpuConfig} `;
             }
 
-            // host and none networks have to be specified using --network,
-            // since they cannot be used with `docker network connect`.
+            if (this.gpus) {
+                dockerCmd += `--gpus ${this.gpus} --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 `;
+            }
+
+            // host and none networks have to be specified using --network, since they cannot be used with
+            // `docker network connect`.
             for (const network of this.argv.network) {
                 if (["host", "none"].includes(network)) {
                     dockerCmd += `--network ${network} `;
                 }
             }
+            // The default podman network mode is not `bridge`, which means a `podman network connect` call will fail
+            // when connecting user defined networks. The workaround is to use a user defined network on container
+            // creation.
+            //
+            // See https://github.com/containers/podman/issues/19577
+            //
+            // This should not clash with the `host` and `none` networks above, since service creation should have
+            // failed when using `host` or `none` networks.
+            if (this._serviceNetworkId) {
+                // `build` alias: https://gitlab.com/gitlab-org/gitlab-runner/-/issues/27060
+                dockerCmd += `--network ${this._serviceNetworkId} --network-alias build `;
+            }
 
-            dockerCmd += `--volume ${buildVolumeName}:/gcl-builds `;
+            if (this.argv.registry) {
+                dockerCmd += `--network ${Utils.gclRegistryPrefix}.net `;
+                dockerCmd += `--volume ${Utils.gclRegistryPrefix}.certs:/etc/containers/certs.d:ro `;
+                dockerCmd += `--volume ${Utils.gclRegistryPrefix}.certs:/etc/docker/certs.d:ro `;
+            }
+
+            dockerCmd += `--volume ${buildVolumeName}:${this.ciProjectDir} `;
             dockerCmd += `--volume ${tmpVolumeName}:${this.fileVariablesDir} `;
-            dockerCmd += "--workdir /gcl-builds ";
+            dockerCmd += `--workdir ${this.ciProjectDir} `;
 
             for (const volume of this.argv.volume) {
-                dockerCmd += `--volume ${volume} `;
+                const v = volume.startsWith("%gcl-cert%:") ? `${this.certVolumeName}${volume.slice("%gcl-cert%".length)}` : volume;
+                dockerCmd += `--volume ${v} `;
             }
 
             for (const extraHost of this.argv.extraHost) {
                 dockerCmd += `--add-host=${extraHost} `;
             }
 
+            if (this.argv.seccomp) {
+                dockerCmd += `--security-opt seccomp=${Utils.safeBashString(this.argv.seccomp)} `;
+            }
+
+            if (this.argv.caFile) {
+                const caFilePath = path.isAbsolute(this.argv.caFile) ? this.argv.caFile : path.resolve(this.argv.cwd, this.argv.caFile);
+                if (await fs.pathExists(caFilePath)) {
+                    dockerCmd += `--volume ${caFilePath}:/etc/ssl/certs/ca-certificates.crt:ro `;
+                    expanded["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt";
+                    expanded["SSL_CERT_DIR"] = "/etc/ssl/certs";
+                } else {
+                    writeStreams.stderr(chalk`{yellow WARNING: CA file not found: ${caFilePath}}\n`);
+                }
+            }
+
             for (const [key, val] of Object.entries(expanded)) {
                 // Replacing `'` with `'\''` to correctly handle single quotes(if `val` contains `'`) in shell commands
-                dockerCmd += `  -e '${key}=${val.replace(/'/g, "'\\''")}' \\\n`;
+                const escaped = val.toString().replaceAll("'", String.raw`'\''`);
+                dockerCmd += `  -e '${key}=${escaped}' \\\n`;
             }
 
             if (this.imageEntrypoint) {
-                if (this.imageEntrypoint[0] == "") {
-                    dockerCmd += "--entrypoint '' ";
-                } else {
-                    dockerCmd += `--entrypoint ${this.imageEntrypoint[0]} `;
-                }
+                dockerCmd += `--entrypoint ${Utils.safeBashString(this.imageEntrypoint[0])} `;
             }
 
             dockerCmd += `${(await this.mountCacheCmd(writeStreams, expanded)).join(" ")} `;
@@ -728,7 +1079,7 @@ export class Job {
 
             if (this.imageEntrypoint?.length ?? 0 > 1) {
                 this.imageEntrypoint?.slice(1).forEach((e) => {
-                    dockerCmd += `"${e}" `;
+                    dockerCmd += `${Utils.safeBashString(e)} `;
                 });
             }
 
@@ -754,16 +1105,9 @@ export class Job {
 
             const {stdout: containerId} = await Utils.bash(dockerCmd, cwd);
 
-            if (this.services?.length) {
-                await Utils.spawn([this.argv.containerExecutable, "network", "connect", "--alias", "build", `gitlab-ci-local-${this.jobId}`, `${containerId}`]);
-            }
-            for (const network of this.argv.network) {
-                // Special network names that do not work with `docker network connect`
-                if (["host", "none"].includes(network)) {
-                    continue;
-                }
-                await Utils.spawn([this.argv.containerExecutable, "network", "connect", network, `${containerId}`]);
-            }
+            // Special network names that do not work with `docker network connect`
+            const connectableNetworks = this.argv.network.filter((network) => !["host", "none"].includes(network));
+            await Promise.all(connectableNetworks.map((network) => Utils.spawn([this.argv.containerExecutable, "network", "connect", network, `${containerId}`])));
 
             this._containerId = containerId;
             this._containersToClean.push(this._containerId);
@@ -780,11 +1124,16 @@ export class Job {
         }
 
         if (imageName) {
-            cmd += "cd /gcl-builds \n";
+            cmd += `cd ${this.ciProjectDir} \n`;
+
+            if (expanded["CI_JOB_STATUS"] != "running") {
+                // Ensures the env `CI_JOB_STATUS` is passed to the after_script context
+                cmd += `export CI_JOB_STATUS=${expanded["CI_JOB_STATUS"]}\n`;
+            }
         }
         cmd += this.generateScriptCommands(scripts);
 
-        cmd += "exit 0\n";
+        cmd += "exit\n";
 
         const jobScriptFile = `${cwd}/${stateDir}/scripts/${safeJobName}_${this.jobId}`;
         await fs.outputFile(jobScriptFile, cmd, "utf-8");
@@ -799,12 +1148,37 @@ export class Job {
             cwd,
             shell: "bash",
             env: imageName ? process.env : expanded,
+            reject: false,
         });
+        const childProcess = cp.nodeChildProcess;
+
+        // eslint-disable-next-line no-control-regex
+        const sectionRegex = /\x1b\[0Ksection_(start|end):(\d+):([^\s[]+)(?:\[[^\]]*\])?\r\x1b\[0K/;
+        const sectionStartTimes = new Map<string, number>();
 
         const outFunc = (line: string, stream: (txt: string) => void, colorize: (str: string) => string) => {
             this.refreshLongRunningSilentTimeout(writeStreams);
+
+            const m = sectionRegex.exec(line);
+            let isSection = false;
+            if (m) {
+                isSection = true;
+                if (m[1] === "start") {
+                    sectionStartTimes.set(m[3], Date.now());
+                    line = chalk`{cyanBright ${m[3]}_started}`;
+                } else {
+                    const elapsed = Date.now() - (sectionStartTimes.get(m[3]) ?? Date.now());
+                    line = chalk`{cyanBright ${m[3]}} took {magenta ${elapsed}ms}`;
+                    sectionStartTimes.delete(m[3]);
+                }
+            }
+
             stream(`${this.formattedJobName} `);
-            if (!line.startsWith("\u001b[32m$")) {
+            if (line.startsWith(GCL_SHELL_PROMPT_PLACEHOLDER)) {
+                // replace the GCL_SHELL_PROMPT_PLACEHOLDER with `$` and make the SHELL_PROMPT line green color
+                line = line.slice(GCL_SHELL_PROMPT_PLACEHOLDER.length);
+                line = chalk`{green $${line}}`;
+            } else if (!isSection) {
                 stream(`${colorize(">")} `);
             }
             stream(`${line}\n`);
@@ -813,16 +1187,38 @@ export class Job {
 
         const quiet = this.argv.quiet;
 
+        const onLines = (readable: Readable, onLine: (line: string) => void) => {
+            const decoder = new StringDecoder("utf8");
+            let rest = "";
+            readable.on("data", (chunk: Buffer) => {
+                const lines = (rest + decoder.write(chunk)).split(/\r?\n/);
+                rest = lines.pop() ?? "";
+                lines.forEach(onLine);
+            });
+            readable.on("end", () => {
+                rest += decoder.end();
+                if (rest) onLine(rest);
+            });
+        };
+
         return await new Promise<number>((resolve, reject) => {
             if (!quiet) {
-                cp.stdout?.pipe(split2()).on("data", (e: string) => outFunc(e, writeStreams.stdout.bind(writeStreams), (s) => chalk`{greenBright ${s}}`));
-                cp.stderr?.pipe(split2()).on("data", (e: string) => outFunc(e, writeStreams.stderr.bind(writeStreams), (s) => chalk`{redBright ${s}}`));
+                onLines(cp.stdout, (e) => outFunc(e, writeStreams.stdout.bind(writeStreams), (s) => chalk`{greenBright ${s}}`));
+                onLines(cp.stderr, (e) => outFunc(e, writeStreams.stderr.bind(writeStreams), (s) => chalk`{redBright ${s}}`));
             }
-            void cp.on("exit", (code) => resolve(code ?? 0));
-            void cp.on("error", (err) => reject(err));
+            // Wait for "close" rather than "exit" so all stdout/stderr data events
+            // have flushed to the output log file before we resolve.
+            childProcess.on("close", (code) => {
+                clearTimeout(this._longRunningSilentTimeout);
+                return resolve(code ?? 0);},
+            );
+            childProcess.on("error", (err) => {
+                clearTimeout(this._longRunningSilentTimeout);
+                return reject(err);
+            });
 
             if (imageName) {
-                cp.stdin?.end("/gcl-cmd");
+                cp.stdin?.end(". /gcl-cmd");
             } else {
                 cp.stdin?.end(`./${stateDir}/scripts/${safeJobName}_${this.jobId}`);
             }
@@ -830,13 +1226,16 @@ export class Job {
     }
 
     private imageName (vars: {[key: string]: string} = {}): string | null {
+        if (this.argv.forceShellExecutor) {
+            return null;
+        }
         const image = this.jobData["image"];
         if (!image) {
             if (this.argv.shellExecutorNoImage) {
                 return null;
             } else {
                 // https://docs.gitlab.com/ee/ci/runners/hosted_runners/linux.html#container-images
-                return "docker.io/ruby:3.1";
+                return this.argv.defaultImage;
             }
         }
         const expanded = Utils.expandVariables(vars);
@@ -851,6 +1250,13 @@ export class Job {
         return Utils.expandText(image["docker"]["user"], vars);
     }
 
+    private imagePlatform (vars: {[key: string]: string} = {}): string | null {
+        const image = this.jobData["image"];
+        if (!image) return null;
+        if (!image["docker"]) return null;
+        return Utils.expandText(image["docker"]["platform"], vars);
+    }
+
     get imageEntrypoint (): string[] | null {
         const image = this.jobData["image"];
 
@@ -861,13 +1267,47 @@ export class Job {
         return image.entrypoint;
     }
 
-    private async pullImage (writeStreams: WriteStreams, imageToPull: string) {
+    get gpus (): string | null {
+        if (this.argv.gpus) {
+            return this.argv.gpus;
+        } else if ("tags" in this.jobData) {
+            for (const tag of this.jobData["tags"]) {
+                if (tag.match(/^(.*-)?gpu(-.*)?$/)) {
+                    return "all";
+                }
+            }
+        }
+        return null;
+    }
+
+    private async validateCiDependencyProxyServerAuthentication (imageName: string) {
+        const CI_DEPENDENCY_PROXY_SERVER = this._variables["CI_DEPENDENCY_PROXY_SERVER"];
+        if (!imageName.startsWith(CI_DEPENDENCY_PROXY_SERVER)) {
+            return;
+        }
+        try {
+            await Utils.spawn([this.argv.containerExecutable, "login", CI_DEPENDENCY_PROXY_SERVER]);
+        } catch (e: any) {
+            const errMsg = `Please authenticate to the Dependency Proxy (${CI_DEPENDENCY_PROXY_SERVER}) https://docs.gitlab.com/ee/user/packages/dependency_proxy/#authenticate-with-the-dependency-proxy`;
+            if (this.argv.containerExecutable == "docker") {
+                assert(!e.stderr.includes("Cannot perform an interactive login"), errMsg);
+            } else if (this.argv.containerExecutable == "podman") {
+                assert(!e.stderr.includes("Username: Error: getting username and password: reading username: EOF"), errMsg);
+            }
+            throw e;
+        }
+    }
+
+    private async pullImage (writeStreams: WriteStreams, imageToPull: string, imagePlatform: string | null = null) {
         const pullPolicy = this.argv.pullPolicy;
+        const platformArgs = imagePlatform ? ["--platform", imagePlatform] : [];
+        const platformSuffix = imagePlatform ? ` (${imagePlatform})` : "";
         const actualPull = async () => {
+            await this.validateCiDependencyProxyServerAuthentication(imageToPull);
             const time = process.hrtime();
-            await Utils.spawn([this.argv.containerExecutable, "pull", imageToPull]);
+            await Utils.spawn([this.argv.containerExecutable, "pull", imageToPull, ...platformArgs]);
             const endTime = process.hrtime(time);
-            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright pulled} ${imageToPull} in {magenta ${prettyHrtime(endTime)}}\n`);
+            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright pulled} ${imageToPull}${platformSuffix} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
             this.refreshLongRunningSilentTimeout(writeStreams);
         };
 
@@ -875,9 +1315,19 @@ export class Job {
             await actualPull();
             return;
         }
+        // The `image inspect` cache check is platform-agnostic — a different-arch
+        // variant of the same image name will satisfy it, causing the requested
+        // platform to silently differ from what's actually on disk. Force a pull
+        // when a specific platform was requested so the matching manifest is
+        // guaranteed locally. Pulls are idempotent: if the variant is already
+        // cached, `docker pull` short-circuits with "Image is up to date".
+        if (imagePlatform) {
+            await actualPull();
+            return;
+        }
         try {
             await Utils.spawn([this.argv.containerExecutable, "image", "inspect", imageToPull]);
-        } catch (e: any) {
+        } catch {
             await actualPull();
         }
     }
@@ -886,26 +1336,21 @@ export class Job {
         const cwd = this.argv.cwd;
         const stateDir = this.argv.stateDir;
         const producers = this.producers;
-        let producerReportsEnvs = {};
-        for (const producer of producers ?? []) {
+        const producerReportsEnvs = await Promise.all((producers ?? []).map(async (producer) => {
             const producerDotenv = Utils.expandText(producer.dotenv, expanded);
-            if (producerDotenv === null) continue;
+            if (producerDotenv === null) return [];
 
             const safeProducerName = Utils.safeDockerString(producer.name);
             const dotenvFolder = `${cwd}/${stateDir}/artifacts/${safeProducerName}/.gitlab-ci-reports/dotenv/`;
-            if (await fs.pathExists(dotenvFolder)) {
-                const dotenvFiles = (await Utils.spawn(["find", ".", "-type", "f"], dotenvFolder)).stdout.split("\n");
-                for (const dotenvFile of dotenvFiles) {
-                    if (dotenvFile == "") continue;
-                    const producerReportEnv = dotenv.parse(await fs.readFile(`${dotenvFolder}/${dotenvFile}`));
-                    producerReportsEnvs = {...producerReportsEnvs, ...producerReportEnv};
-                }
-            } else {
+            if (!await fs.pathExists(dotenvFolder)) {
                 writeStreams.stderr(chalk`${this.formattedJobName} {yellow reports.dotenv produced by '${producer.name}' could not be found}\n`);
+                return [];
             }
 
-        }
-        return producerReportsEnvs;
+            const dotenvFiles = (await Utils.spawn(["find", ".", "-type", "f"], dotenvFolder)).stdout.split("\n").filter((dotenvFile) => dotenvFile != "");
+            return Promise.all(dotenvFiles.map(async (dotenvFile) => dotenv.parse(await fs.readFile(`${dotenvFolder}/${dotenvFile}`))));
+        }));
+        return Object.assign({}, ...producerReportsEnvs.flat());
     }
 
     private async copyCacheIn (writeStreams: WriteStreams, expanded: {[key: string]: string}) {
@@ -915,22 +1360,22 @@ export class Job {
         const cwd = this.argv.cwd;
         const stateDir = this.argv.stateDir;
 
-        for (const c of this.cache) {
+        await Promise.all(this.cache.map(async (c, index) => {
             if (!["pull", "pull-push"].includes(c.policy)) return;
 
             const time = process.hrtime();
-            const cacheName = await this.getUniqueCacheName(cwd, expanded, c.key);
+            const cacheName = await this.getUniqueCacheName(cwd, expanded, index);
             const cacheFolder = `${cwd}/${stateDir}/cache/${cacheName}`;
             if (!await fs.pathExists(cacheFolder)) {
-                continue;
+                return;
             }
 
             await Mutex.exclusive(cacheName, async () => {
                 await this.copyIn(cacheFolder);
             });
             const endTime = process.hrtime(time);
-            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright imported cache '${cacheName}'} in {magenta ${prettyHrtime(endTime)}}\n`);
-        }
+            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright imported cache '${cacheName}'} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
+        }));
     }
 
     private async copyArtifactsIn (writeStreams: WriteStreams) {
@@ -939,8 +1384,7 @@ export class Job {
         const cwd = this.argv.cwd;
         const stateDir = this.argv.stateDir;
         const time = process.hrtime();
-        const promises = [];
-        for (const producer of this.producers ?? []) {
+        await Promise.all((this.producers ?? []).map(async (producer) => {
             const producerSafeName = Utils.safeDockerString(producer.name);
             const artifactFolder = `${cwd}/${stateDir}/artifacts/${producerSafeName}`;
             if (!await fs.pathExists(artifactFolder)) {
@@ -952,11 +1396,10 @@ export class Job {
                 writeStreams.stderr(chalk`${this.formattedJobName} {yellow artifacts from {blueBright ${producerSafeName}} was empty}\n`);
             }
 
-            promises.push(this.copyIn(artifactFolder));
-        }
-        await Promise.all(promises);
+            await this.copyIn(artifactFolder);
+        }));
         const endTime = process.hrtime(time);
-        writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright imported artifacts} in {magenta ${prettyHrtime(endTime)}}\n`);
+        writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright imported artifacts} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
     }
 
     copyIn (source: string) {
@@ -964,7 +1407,7 @@ export class Job {
         if (!this.imageName(this._variables) && this.argv.shellIsolation) {
             return Utils.spawn(["rsync", "-a", `${source}/.`, `${this.argv.cwd}/${this.argv.stateDir}/builds/${safeJobName}`]);
         }
-        return Utils.spawn([this.argv.containerExecutable, "cp", `${source}/.`, `${this._containerId}:/gcl-builds`]);
+        return Utils.spawn([this.argv.containerExecutable, "cp", `${source}/.`, `${this._containerId}:${this.ciProjectDir}`]);
     }
 
     private async copyCacheOut (writeStreams: WriteStreams, expanded: {[key: string]: string}) {
@@ -973,68 +1416,108 @@ export class Job {
 
         const cwd = this.argv.cwd;
         const stateDir = this.argv.stateDir;
+        const cachePath = this.imageName(expanded) ? "/cache" : "../../cache";
 
-        let time, endTime;
-        for (const c of this.cache) {
-            if (!["push", "pull-push"].includes(c.policy)) return;
-            if ("on_success" === c.when && this.jobStatus !== "success") return;
-            if ("on_failure" === c.when && this.jobStatus === "success") return;
-            const cacheName = await this.getUniqueCacheName(cwd, expanded, c.key);
+        const exportedCaches = [...this.cache.entries()].filter(([, c]) => ["push", "pull-push"].includes(c.policy) && (c.when !== "on_success" || this.jobStatus === "success") && (c.when !== "on_failure" || this.jobStatus !== "success"));
+        await Promise.all(exportedCaches.map(async ([index, c]) => {
+            const cacheName = await this.getUniqueCacheName(cwd, expanded, index);
+
+            let paths = "";
             for (const path of c.paths) {
-                time = process.hrtime();
-                const expandedPath = Utils.expandText(path, expanded).replace(`${expanded.CI_PROJECT_DIR}/`, "");
-                let cmd = "shopt -s globstar nullglob dotglob\n";
-                cmd += `mkdir -p ../../cache/${cacheName}\n`;
-                cmd += `rsync -Ra ${expandedPath} ../../cache/${cacheName}/. || true\n`;
+                if (!Utils.isSubpath(path, this.argv.cwd, this.argv.cwd)) continue;
 
-                await Mutex.exclusive(cacheName, async () => {
-                    await this.copyOut(cmd, stateDir, "cache", []);
-                });
-                endTime = process.hrtime(time);
-
-                const readdir = await fs.readdir(`${this.argv.cwd}/${stateDir}/cache/${cacheName}`);
-                if (readdir.length === 0) {
-                    writeStreams.stdout(chalk`${this.formattedJobName} {yellow !! no cache was copied for ${path} !!}\n`);
-                } else {
-                    writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright exported cache ${expandedPath} '${cacheName}'} in {magenta ${prettyHrtime(endTime)}}\n`);
-                }
+                paths += " ./" + Utils.expandText(path, expanded).replace(`${expanded.CI_PROJECT_DIR}/`, "");
             }
-        }
+
+            const time = process.hrtime();
+            let cmd = "shopt -s globstar nullglob dotglob\n";
+            cmd += `mkdir -p ${Utils.safeBashString(cachePath + "/" + cacheName)}\n`;
+            cmd += `rsync -Ra ${paths} ${Utils.safeBashString(cachePath + "/" + cacheName + "/.")} || true\n`;
+
+            await Mutex.exclusive(cacheName, async () => {
+                await this.copyOut(cmd, stateDir, "cache", []);
+            });
+            const endTime = process.hrtime(time);
+
+            for (const __path of c.paths) {
+                const _path = Utils.expandText(__path, expanded);
+                if (!Utils.isSubpath(_path, this.argv.cwd, this.argv.cwd)) {
+                    writeStreams.stdout(chalk`{yellow WARNING: processPath: artifact path is not a subpath of project directory: ${_path}}\n`);
+                    continue;
+                }
+
+                let path = _path;
+                if (isGlob(path) && !path.endsWith("*")) {
+                    path = `${path}/**`;
+                }
+
+                let numOfFiles = globbySync(path, {
+                    dot: true,
+                    onlyFiles: false,
+                    cwd: `${this.argv.cwd}/${stateDir}/cache/${cacheName}`,
+                }).length;
+
+                if (numOfFiles == 0) {
+                    writeStreams.stdout(chalk`{yellow WARNING: ${path}: no matching files. Ensure that the artifact path is relative to the working directory}\n`);
+                    continue;
+                }
+
+                if (!isGlob(path)) numOfFiles++; // add one because the pattern itself is a folder
+
+                writeStreams.stdout(`${_path}: found ${numOfFiles} artifact files and directories\n`);
+            }
+            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright cache created in '${stateDir}/cache/${cacheName}'} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
+        }));
     }
 
     private async copyArtifactsOut (writeStreams: WriteStreams, expanded: {[key: string]: string}) {
-        // TODO: update the condition to support when:on_success / when:on_failure
-        if (this.jobStatus !== "success" && this.artifacts?.when !== "always") return;
         if (!this.artifacts) return;
-        if ((this.artifacts.paths?.length ?? 0) === 0 && this.artifacts.reports?.dotenv == null) return;
+
+        const when = this.artifacts.when ?? "on_success";
+        const copyArtifactsPaths = !(when === "on_success" && this.jobStatus !== "success") && !(when === "on_failure" && this.jobStatus === "success");
+        const artifactsPaths = copyArtifactsPaths ? this.artifacts.paths ?? [] : [];
+
+        const copyDotEnv = this.artifacts.reports?.dotenv != null;
+
+        if (artifactsPaths.length === 0 && !copyDotEnv) return;
 
         const safeJobName = this.safeJobName;
         const cwd = this.argv.cwd;
         const stateDir = this.argv.stateDir;
-        const artifactsPath = !this.argv.shellIsolation && !this.imageName(expanded) ? `${stateDir}/artifacts` : "../../artifacts";
+        let artifactsPath: string;
+
+        if (!this.argv.shellIsolation && !this.imageName(expanded)) {
+            artifactsPath = `${stateDir}/artifacts`;
+        } else if (this.imageName(expanded)) {
+            artifactsPath = "/artifacts";
+        } else {
+            artifactsPath = "../../artifacts";
+        }
 
         let time, endTime;
         let cpCmd = "shopt -s globstar nullglob dotglob\n";
         cpCmd += `mkdir -p ${artifactsPath}/${safeJobName}\n`;
-        cpCmd += "rsync --exclude '.gitlab-ci-local/**' -Ra ";
+        cpCmd += "_gcl_files_tmp=\\$(mktemp)\n";
+        for (const artifactPath of artifactsPaths) {
+            const expandedPath = Utils.expandText(artifactPath, expanded).replace(`${expanded.CI_PROJECT_DIR}/`, "");
+            cpCmd += `for _gcl_f in ./${expandedPath}; do printf '%s\\n' "\\$_gcl_f"; done >> \\$_gcl_files_tmp\n`;
+        }
+        cpCmd += "rsync --exclude '.gitlab-ci-local/**' -rRa ";
         for (const artifactExcludePath of this.artifacts?.exclude ?? []) {
             const expandedPath = Utils.expandText(artifactExcludePath, expanded).replace(`${expanded.CI_PROJECT_DIR}/`, "");
             cpCmd += `--exclude '${expandedPath}' `;
         }
-        for (const artifactPath of this.artifacts?.paths ?? []) {
-            const expandedPath = Utils.expandText(artifactPath, expanded).replace(`${expanded.CI_PROJECT_DIR}/`, "");
-            cpCmd += `${expandedPath} `;
-        }
-        cpCmd += `${artifactsPath}/${safeJobName}/. || true\n`;
+        cpCmd += `--files-from=\\$_gcl_files_tmp . ${artifactsPath}/${safeJobName}/. || true\n`;
+        cpCmd += "rm -f \\$_gcl_files_tmp\n";
         const reportDotenv = Utils.expandText(this.artifacts.reports?.dotenv ?? null, expanded);
-        const reportDotenvs: string[] | null = (typeof reportDotenv === "string") // normalize to string[] for easier handling
-            ? [reportDotenv]
-            : reportDotenv;
+        const reportDotenvs: string[] | null = (typeof reportDotenv === "string") ? // normalize to string[] for easier handling
+            [reportDotenv] :
+            reportDotenv;
         if (reportDotenvs != null) {
             reportDotenvs.forEach((reportDotenv) => {
                 cpCmd += `mkdir -p ${artifactsPath}/${safeJobName}/.gitlab-ci-reports/dotenv\n`;
                 cpCmd += `if [ -f ${reportDotenv} ]; then\n`;
-                cpCmd += `  rsync -Ra ${reportDotenv} ${artifactsPath}/${safeJobName}/.gitlab-ci-reports/dotenv/.\n`;
+                cpCmd += `  rsync -Ra ./${reportDotenv} ${artifactsPath}/${safeJobName}/.gitlab-ci-reports/dotenv/.\n`;
                 cpCmd += "fi\n";
             });
         }
@@ -1044,19 +1527,16 @@ export class Job {
         await this.copyOut(cpCmd, stateDir, "artifacts", dockerCmdExtras);
         endTime = process.hrtime(time);
 
-        if (reportDotenvs != null) {
-            reportDotenvs.forEach(async (reportDotenv) => {
-                if (!await fs.pathExists(`${cwd}/${stateDir}/artifacts/${safeJobName}/.gitlab-ci-reports/dotenv/${reportDotenv}`)) {
-                    writeStreams.stderr(chalk`${this.formattedJobName} {yellow artifact reports dotenv '${reportDotenv}' could not be found}\n`);
-                }
-            });
-        }
+        await Promise.all((reportDotenvs ?? []).map(async (reportDotenv) => {
+            if (await fs.pathExists(`${cwd}/${stateDir}/artifacts/${safeJobName}/.gitlab-ci-reports/dotenv/${reportDotenv}`)) return;
+            writeStreams.stderr(chalk`${this.formattedJobName} {yellow artifact reports dotenv '${reportDotenv}' could not be found}\n`);
+        }));
 
         const readdir = await fs.readdir(`${cwd}/${stateDir}/artifacts/${safeJobName}`);
         if (readdir.length === 0) {
             writeStreams.stdout(chalk`${this.formattedJobName} {yellow !! no artifacts was copied !!}\n`);
         } else {
-            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright exported artifacts} in {magenta ${prettyHrtime(endTime)}}\n`);
+            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright exported artifacts} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
         }
 
         if (this.artifactsToSource && (this.argv.shellIsolation || this.imageName(expanded))) {
@@ -1066,7 +1546,7 @@ export class Job {
                 await Utils.spawn(["rsync", "-a", `${cwd}/${stateDir}/artifacts/${safeJobName}/.gitlab-ci-reports/dotenv/.`, cwd]);
             }
             endTime = process.hrtime(time);
-            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright copied artifacts to cwd} in {magenta ${prettyHrtime(endTime)}}\n`);
+            writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright copied artifacts to cwd} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
         }
     }
 
@@ -1074,11 +1554,15 @@ export class Job {
         const safeJobName = this.safeJobName;
         const buildVolumeName = this.buildVolumeName;
         const cwd = this.argv.cwd;
+        const helperImageName = this.argv.helperImage;
 
         await fs.mkdirp(`${cwd}/${stateDir}/${type}`);
 
         if (this.imageName(this._variables)) {
-            const {stdout: containerId} = await Utils.bash(`${this.argv.containerExecutable} create -i ${dockerCmdExtras.join(" ")} -v ${buildVolumeName}:/gcl-builds/ -w /gcl-builds docker.io/firecow/gitlab-ci-local-util bash -c "${cmd}"`, cwd);
+            const cmdWithWritablePerms = `${cmd}\nchmod -R u+w /${type} 2>/dev/null || true`;
+            // eslint-disable-next-line @stylistic/quotes
+            const escapedCmd = cmdWithWritablePerms.replaceAll('"', String.raw`\"`);
+            const {stdout: containerId} = await Utils.bash(`${this.argv.containerExecutable} create -i ${dockerCmdExtras.join(" ")} -v ${buildVolumeName}:${this.ciProjectDir} -w ${this.ciProjectDir} ${helperImageName} bash -c "${escapedCmd}"`, cwd);
             this._containersToClean.push(containerId);
             await Utils.spawn([this.argv.containerExecutable, "start", containerId, "--attach"]);
             await Utils.spawn([this.argv.containerExecutable, "cp", `${containerId}:/${type}/.`, `${stateDir}/${type}/.`], cwd);
@@ -1113,11 +1597,11 @@ export class Job {
         // Won't print if jobStatus is "success" because that will be printed via the `printFinishedString()`
         if (this.jobStatus === "warning") {
             writeStreams.stderr(
-                chalk`${finishedStr} {black.bgYellowBright  WARN ${code.toString()} }\n`
+                chalk`${finishedStr} {black.bgYellowBright  WARN ${code.toString()} }\n`,
             );
         } else if (this.jobStatus === "failed") {
             writeStreams.stderr(
-                chalk`${finishedStr} {black.bgRed  FAIL ${code.toString()} }\n`
+                chalk`${finishedStr} {black.bgRed  FAIL ${code.toString()} }\n`,
             );
         }
     }
@@ -1128,7 +1612,7 @@ export class Job {
 
         if (code !== 0) {
             writeStreams.stderr(
-                chalk`${finishedStr} {black.bgYellowBright  WARN ${code.toString()} } after_script\n`
+                chalk`${finishedStr} {black.bgYellowBright  WARN ${code.toString()} } after_script\n`,
             );
         }
     }
@@ -1143,106 +1627,121 @@ export class Job {
         let dockerCmd = `${this.argv.containerExecutable} create --interactive `;
         this.refreshLongRunningSilentTimeout(writeStreams);
 
-        if (expanded["FF_DISABLE_UMASK_FOR_DOCKER_EXECUTOR"] === "false") {
-            dockerCmd += "--user 0:0 ";
+        if (this.argv.userns != undefined) {
+            dockerCmd += `--userns=${this.argv.userns} `;
         }
 
         if (this.argv.privileged) {
             dockerCmd += "--privileged ";
         }
 
+        for (const device of this.argv.device) {
+            dockerCmd += `--device ${device} `;
+        }
+
         if (this.argv.ulimit !== null) {
             dockerCmd += `--ulimit nofile=${this.argv.ulimit} `;
         }
 
+        if (this.argv.shmSize != undefined) {
+            dockerCmd += `--shm-size=${this.argv.shmSize} `;
+        }
+
+        if (this.gpus) {
+            dockerCmd += `--gpus ${this.gpus} --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 `;
+        }
+
         for (const volume of this.argv.volume) {
-            dockerCmd += `--volume ${volume} `;
+            const v = volume.startsWith("%gcl-cert%:") ? `${this.certVolumeName}${volume.slice("%gcl-cert%".length)}` : volume;
+            dockerCmd += `--volume ${v} `;
         }
 
         for (const extraHost of this.argv.extraHost) {
             dockerCmd += `--add-host=${extraHost} `;
         }
 
-        const serviceAlias = service.alias;
-        const serviceName = service.name;
-        const serviceNameWithoutVersion = serviceName.replace(/(.*)(:.*)/, "$1");
-        const aliases = new Set<string>();
-        aliases.add(serviceNameWithoutVersion.replaceAll("/", "-"));
-        aliases.add(serviceNameWithoutVersion.replaceAll("/", "__"));
-        if (serviceAlias) {
-            aliases.add(serviceAlias);
+        if (this.argv.seccomp) {
+            dockerCmd += `--security-opt seccomp=${Utils.safeBashString(this.argv.seccomp)} `;
         }
+        if (this.argv.registry) {
+            dockerCmd += `--volume ${Utils.gclRegistryPrefix}.certs:/etc/containers/certs.d:ro `;
+            dockerCmd += `--volume ${Utils.gclRegistryPrefix}.certs:/etc/docker/certs.d:ro `;
+        }
+
+        if (this.argv.caFile) {
+            const caFilePath = path.isAbsolute(this.argv.caFile) ? this.argv.caFile : path.resolve(this.argv.cwd, this.argv.caFile);
+            if (await fs.pathExists(caFilePath)) {
+                dockerCmd += `--volume ${caFilePath}:/etc/ssl/certs/ca-certificates.crt:ro `;
+                expanded["SSL_CERT_FILE"] = "/etc/ssl/certs/ca-certificates.crt";
+                expanded["SSL_CERT_DIR"] = "/etc/ssl/certs";
+            }
+        }
+
+        const serviceName = service.name;
+        const aliases = Utils.getAllServiceAliases(service);
 
         for (const [key, val] of Object.entries(expanded)) {
             // Replacing `'` with `'\''` to correctly handle single quotes(if `val` contains `'`) in shell commands
-            dockerCmd += `  -e '${key}=${val.replace(/'/g, "'\\''")}' \\\n`;
+            const escaped = val.toString().replaceAll("'", String.raw`'\''`);
+            dockerCmd += `  -e '${key}=${escaped}' \\\n`;
         }
 
         const serviceEntrypoint = service.entrypoint;
         if (serviceEntrypoint) {
-            if (serviceEntrypoint[0] == "") {
-                dockerCmd += "--entrypoint '' ";
-            } else {
-                dockerCmd += `--entrypoint ${serviceEntrypoint[0]} `;
-            }
+            dockerCmd += `--entrypoint ${Utils.safeBashString(serviceEntrypoint[0])} `;
         }
-        dockerCmd += `--volume ${this.buildVolumeName}:/gcl-builds `;
+        dockerCmd += `--volume ${this.buildVolumeName}:${this.ciProjectDir} `;
         dockerCmd += `--volume ${this.tmpVolumeName}:${this.fileVariablesDir} `;
-        dockerCmd += `${serviceName} `;
 
-        // host and none networks have to be specified using --network,
-        // since they cannot be used with `docker network connect`.
-        for (const network of this.argv.network) {
-            if (["host", "none"].includes(network)) {
-                dockerCmd += `--network ${network} `;
-            }
+        // The default podman network mode is not `bridge`, which means a `podman network connect` call will fail
+        // when connecting user defined networks. The workaround is to use a user defined network on container
+        // creation.
+        //
+        // See https://github.com/containers/podman/issues/19577
+        dockerCmd += `--network ${this._serviceNetworkId} `;
+        for (const alias of aliases) {
+            dockerCmd += `--network-alias ${alias} `;
         }
+
+        dockerCmd += `${serviceName} `;
 
         if (serviceEntrypoint?.length ?? 0 > 1) {
             serviceEntrypoint?.slice(1).forEach((e) => {
-                dockerCmd += `"${e}" `;
+                dockerCmd += `${Utils.safeBashString(e)} `;
             });
         }
-        (service.command ?? []).forEach((e) => dockerCmd += `"${e.replace(/\$/g, "\\$")}" `);
+        for (const e of service.command ?? []) {
+            const escaped = e.replaceAll("$", String.raw`\$`);
+            dockerCmd += `"${escaped}" `;
+        }
 
         const time = process.hrtime();
 
         const {stdout: containerId} = await Utils.bash(dockerCmd, cwd);
         this._containersToClean.push(containerId);
 
-        const aliasArgs = Array.from(aliases.values()).flatMap((alias) => ["--alias", alias]);
-        await Utils.spawn([this.argv.containerExecutable, "network", "connect", ...aliasArgs, `gitlab-ci-local-${this.jobId}`, `${containerId}`]);
-        for (const network of this.argv.network) {
-            // Special network names that do not work with `docker network connect`.
-            if (["host", "none"].includes(network)) {
-                continue;
-            }
-            await Utils.spawn([this.argv.containerExecutable, "network", "connect", network, `${containerId}`]);
+        await Promise.all(this.argv.network.map((network) => Utils.spawn([this.argv.containerExecutable, "network", "connect", network, `${containerId}`])));
+
+        if (this.argv.registry) {
+            await Utils.spawn([this.argv.containerExecutable, "network", "connect", `${Utils.gclRegistryPrefix}.net`, `${containerId}`]);
         }
 
         await Utils.spawn([this.argv.containerExecutable, "start", `${containerId}`]);
 
         const endTime = process.hrtime(time);
-        writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright started service image: ${serviceName} with aliases: ${Array.from(aliases).join(", ")}} in {magenta ${prettyHrtime(endTime)}}\n`);
+        writeStreams.stdout(chalk`${this.formattedJobName} {magentaBright started service image: ${serviceName} with aliases: ${Array.from(aliases).join(", ")}} in {magenta ${Utils.prettyHrtime(endTime)}}\n`);
 
         return containerId;
     }
 
-    private async serviceHealthCheck (writeStreams: WriteStreams, service: Service, serviceIndex: number, serviceContanerLogFile: string) {
-        const serviceAlias = service.alias;
+    private async serviceHealthCheck (writeStreams: WriteStreams, service: Service, serviceIndex: number, serviceContainerLogFile: string) {
+        const serviceAlias = Utils.getServiceAlias(service);
         const serviceName = service.name;
+        const waitImageName = this.argv.waitImage;
+        const waitForServicesTimeout = this.argv.waitForServicesTimeout;
 
         const {stdout} = await Utils.spawn([this.argv.containerExecutable, "image", "inspect", serviceName]);
         const imageInspect = JSON.parse(stdout);
-
-        // Copied from the startService block. Important thing is that the aliases match
-        const serviceNameWithoutVersion = serviceName.replace(/(.*)(:.*)/, "$1");
-        const aliases = [serviceNameWithoutVersion.replaceAll("/", "-"), serviceNameWithoutVersion.replaceAll("/", "__")];
-        if (serviceAlias) {
-            aliases.push(serviceAlias);
-        }
-
-        const uniqueAlias = aliases[aliases.length - 1];
 
         if ((imageInspect[0]?.Config?.ExposedPorts ?? null) === null) {
             return writeStreams.stderr(chalk`${this.formattedJobName} {yellow Could not find exposed tcp ports ${serviceName}}\n`);
@@ -1251,14 +1750,17 @@ export class Job {
         const time = process.hrtime();
         try {
             // Iterate over each port defined in the image, and try to connect to the alias
-            await Promise.any(Object.keys(imageInspect[0].Config.ExposedPorts).map((port) => {
-                if (!port.endsWith("/tcp")) return;
-                const portNum = parseInt(port.replace("/tcp", ""));
-                const spawnCmd = [this.argv.containerExecutable, "run", "--rm", `--name=gcl-wait-for-it-${this.jobId}-${serviceIndex}-${portNum}`, "--network", `gitlab-ci-local-${this.jobId}`, "docker.io/sumina46/wait-for-it", `${uniqueAlias}:${portNum}`, "-t", "30"];
-                return Utils.spawn(spawnCmd);
-            }));
+            await Promise.any(Object.keys(imageInspect[0].Config.ExposedPorts)
+                .filter((port) => port.endsWith("/tcp"))
+                .map((port) => {
+                    const portNum = Number.parseInt(port.replace("/tcp", ""));
+                    const containerName = `gcl-wait-for-it-${this.jobId}-${serviceIndex}-${portNum}`;
+                    const spawnCmd = [this.argv.containerExecutable, "run", "--rm", `--name=${containerName}`, "--network", `${this._serviceNetworkId}`, `${waitImageName}`, `${serviceAlias}:${portNum}`, "-t", `${waitForServicesTimeout}`];
+                    this._containersToClean.push(containerName);
+                    return Utils.spawn(spawnCmd);
+                }));
             const endTime = process.hrtime(time);
-            writeStreams.stdout(chalk`${this.formattedJobName} {greenBright service image: ${serviceName} healthcheck passed in {green ${prettyHrtime(endTime)}}}\n`);
+            writeStreams.stdout(chalk`${this.formattedJobName} {greenBright service image: ${serviceName} healthcheck passed in {green ${Utils.prettyHrtime(endTime)}}}\n`);
         } catch (e: any) {
             if (!(e instanceof AggregateError)) throw e;
             e.errors.forEach((singleError: Error) => {
@@ -1266,16 +1768,47 @@ export class Job {
                 singleError.message.split(/\r?\n/g).forEach((line: string) => {
                     writeStreams.stdout(chalk`${this.formattedJobName} {redBright   ${line}}\n`);
                 });
-                writeStreams.stdout(chalk`${this.formattedJobName} {redBright also see (${serviceContanerLogFile})}\n`);
+                writeStreams.stdout(chalk`${this.formattedJobName} {redBright also see (${serviceContainerLogFile})}\n`);
             });
         } finally {
             // Kill all wait-for-it containers, when one have been successful
-            await Promise.allSettled(Object.keys(imageInspect[0].Config.ExposedPorts).map((port) => {
-                if (!port.endsWith("/tcp")) return;
-                const portNum = parseInt(port.replace("/tcp", ""));
-                return Utils.spawn([this.argv.containerExecutable, "rm", "-vf", `gcl-wait-for-it-${this.jobId}-${serviceIndex}-${portNum}`]);
-            }));
+            await Promise.allSettled(Object.keys(imageInspect[0].Config.ExposedPorts)
+                .filter((port) => port.endsWith("/tcp"))
+                .map((port) => {
+                    const portNum = Number.parseInt(port.replace("/tcp", ""));
+                    return Utils.spawn([this.argv.containerExecutable, "rm", "-vf", `gcl-wait-for-it-${this.jobId}-${serviceIndex}-${portNum}`]);
+                }));
         }
+    }
+
+    private async fetchTriggerInclude () {
+        const {cwd, stateDir} = this.argv;
+
+        fs.mkdirpSync(`${cwd}/${stateDir}/includes/triggers`);
+
+        const includeContents = await Promise.all((this.jobData.trigger?.include ?? []).map(async (include: any) => {
+            if (include["local"]) {
+                const expandedInclude = Utils.expandText(include["local"], this._variables);
+                validateIncludeLocal(expandedInclude);
+                const files = await resolveIncludeLocal(expandedInclude, cwd);
+                if (files.length == 0) {
+                    throw new AssertionError({message: `Local include file \`${include["local"]}\` specified in \`.${this.name}\` cannot be found!`});
+                }
+
+                return Promise.all(files.map((file) => Parser.loadYaml(file, {skipInputValidation: this.argv.skipInputValidation}, true, this.writeStreams)));
+            } else if (include["artifact"]) {
+                return [await Parser.loadYaml(`${cwd}/${stateDir}/artifacts/${include["job"]}/${include["artifact"]}`, {skipInputValidation: this.argv.skipInputValidation}, true, this.writeStreams)];
+            } else if (include["project"]) {
+                this.writeStreams.memoStdout(chalk`{bgYellowBright  WARN } \`{blueBright ${this.name}.trigger.include.*.project}\` will be no-op. It is currently not implemented\n`);
+
+            } else if (include["template"]) {
+                this.writeStreams.memoStdout(chalk`{bgYellowBright  WARN } \`{blueBright ${this.name}.trigger.include.*.template}\` will be no-op. It is currently not implemented\n`);
+            }
+            return [];
+        }));
+        const contents = Object.assign({}, ...includeContents.flat());
+        const target = `${cwd}/${stateDir}/includes/triggers/${this.name}.yml`;
+        fs.writeFileSync(target, yaml.dump(contents));
     }
 }
 

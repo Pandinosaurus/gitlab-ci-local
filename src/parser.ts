@@ -1,25 +1,25 @@
-import chalk from "chalk";
-import path from "path";
-import deepExtend from "deep-extend";
-import * as fs from "fs-extra";
+import chalk from "chalk-template";
+import path from "node:path";
+import fs from "fs-extra";
 import * as yaml from "js-yaml";
-import prettyHrtime from "pretty-hrtime";
-import {Job} from "./job";
-import * as DataExpander from "./data-expander";
-import {Utils} from "./utils";
-import assert from "assert";
-import {Validator} from "./validator";
-import * as parallel from "./parallel";
-import {GitData} from "./git-data";
-import {ParserIncludes} from "./parser-includes";
-import {Producers} from "./producers";
-import {VariablesFromFiles} from "./variables-from-files";
-import {Argv} from "./argv";
-import {WriteStreams} from "./write-streams";
-import {init as initPredefinedVariables} from "./predefined-variables";
+import {RE2JS} from "re2js";
+import {Job} from "./job.js";
+import * as DataExpander from "./data-expander.js";
+import {Utils} from "./utils.js";
+import assert, {AssertionError} from "node:assert";
+import {Validator} from "./validator.js";
+import * as parallel from "./parallel.js";
+import {GitData} from "./git-data.js";
+import {ParserIncludes} from "./parser-includes.js";
+import {Producers} from "./producers.js";
+import {VariablesFromFiles} from "./variables-from-files.js";
+import {Argv} from "./argv.js";
+import {WriteStreams} from "./write-streams.js";
+import {init as initPredefinedVariables} from "./predefined-variables.js";
 
 const MAX_FUNCTIONS = 3;
-const INCLUDE_INPUTS_SUPPORTED_TYPES = ["string", "boolean", "number"];
+const INCLUDE_INPUTS_SUPPORTED_TYPES = ["string", "boolean", "number", "array"] as const;
+export type InputType = typeof INCLUDE_INPUTS_SUPPORTED_TYPES[number];
 
 export class Parser {
 
@@ -57,19 +57,33 @@ export class Parser {
         const parser = new Parser(argv, writeStreams, pipelineIid, jobs, expandVariables);
         const time = process.hrtime();
         await parser.init();
-        const warnings = await Validator.run(parser.jobs, parser.stages);
+        const warnings = Validator.run(parser.jobs, parser.stages);
+
+        for (const job of parser.jobs) {
+            if (job.artifacts === null) {
+                job.deleteArtifacts();
+            }
+        }
+
         const parsingTime = process.hrtime(time);
-        writeStreams.stderr(chalk`{grey parsing and downloads finished} in {grey ${prettyHrtime(parsingTime)}}\n`);
+        const pathToExpandedGitLabCi = path.join(argv.cwd, argv.stateDir, "expanded-gitlab-ci.yml");
+        fs.mkdirpSync(path.join(argv.cwd, argv.stateDir));
+        fs.writeFileSync(pathToExpandedGitLabCi, yaml.dump(parser.gitlabData));
+        if (argv.childPipelineDepth == 0) writeStreams.stderr(chalk`{grey parsing and downloads finished in ${Utils.prettyHrtime(parsingTime)}.}\n`);
 
         for (const warning of warnings) {
             writeStreams.stderr(chalk`{yellow ${warning}}\n`);
         }
 
         // # Second layer of check for errors that are not caught in Validator.run
-        if (parser.argv.enableJsonSchemaValidation) {
+        if (parser.argv.jsonSchemaValidation) {
             const time = process.hrtime();
-            Validator.jsonSchemaValidation(parser.gitlabData);
-            writeStreams.stderr(chalk`{grey json schema validated} in {grey ${prettyHrtime(process.hrtime(time))}}\n`);
+            Validator.jsonSchemaValidation({
+                pathToExpandedGitLabCi,
+                gitLabCiConfig: parser.gitlabData,
+                argv,
+            });
+            if (argv.childPipelineDepth == 0) writeStreams.stderr(chalk`{grey json schema validated in ${Utils.prettyHrtime(process.hrtime(time))}}\n`);
         }
         return parser;
     }
@@ -84,32 +98,54 @@ export class Parser {
         const fetchIncludes = argv.fetchIncludes;
         const gitData = await GitData.init(cwd, writeStreams);
         const variablesFromFiles = await VariablesFromFiles.init(argv, writeStreams, gitData);
-        const predefinedVariables = initPredefinedVariables({gitData, argv});
         const envMatchedVariables = Utils.findEnvMatchedVariables(variablesFromFiles);
+        const predefinedVariables = initPredefinedVariables({gitData, argv, envMatchedVariables});
         const variables = {...predefinedVariables, ...envMatchedVariables, ...argv.variable};
         const expanded = Utils.expandVariables(variables);
 
+        // Load inputs from file and merge with CLI inputs
+        const inputs = await this.loadInputs(cwd, argv);
+
+        // Build root-level inputs from global CLI + global file inputs
+        const fileInputs = inputs._file ?? {};
+        const rootInputs = {...Utils.getGlobalFileInputs(fileInputs), ...inputs._cliGlobal};
+
         let yamlDataList: any[] = [{stages: [".pre", "build", "test", "deploy", ".post"]}];
-        const gitlabCiData = await Parser.loadYaml(`${cwd}/${file}`, {}, this.expandVariables);
+        const gitlabCiData = await Parser.loadYaml(`${cwd}/${file}`, {inputs: rootInputs, skipInputValidation: argv.skipInputValidation}, this.expandVariables, writeStreams);
 
-        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiData, {cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables}));
+        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiData, {argv, cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables, maximumIncludes: argv.maximumIncludes, inputs}));
         ParserIncludes.resetCount();
 
-        const gitlabCiLocalData = await Parser.loadYaml(`${cwd}/.gitlab-ci-local.yml`, {}, this.expandVariables);
-        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiLocalData, {cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables}));
+        const gitlabCiLocalData = await Parser.loadYaml(`${cwd}/.gitlab-ci-local.yml`, {skipInputValidation: argv.skipInputValidation}, this.expandVariables, writeStreams);
+        yamlDataList = yamlDataList.concat(await ParserIncludes.init(gitlabCiLocalData, {argv, cwd, stateDir, writeStreams, gitData, fetchIncludes, variables: expanded, expandVariables: this.expandVariables, maximumIncludes: argv.maximumIncludes, inputs}));
         ParserIncludes.resetCount();
 
-        const gitlabData: any = deepExtend({}, ...yamlDataList);
+        const gitlabData: any = Utils.deepMerge({}, ...yamlDataList);
 
         // Expand various fields in gitlabData
         DataExpander.jobExtends(gitlabData);
         DataExpander.reference(gitlabData, gitlabData);
-        DataExpander.complexObjects(gitlabData);
-        DataExpander.defaults(gitlabData);
-        DataExpander.globalVariables(gitlabData);
         DataExpander.flattenLists(gitlabData);
+        DataExpander.transformDeprecatedGlobalDefaultSyntax(gitlabData);
+        DataExpander.inheritDefault(gitlabData);
+        DataExpander.normalize(gitlabData);
 
-        assert(gitlabData.stages && Array.isArray(gitlabData.stages), chalk`{yellow stages:} must be an array`);
+        // Evaluate workflow:rules and merge matched rule variables into global variables
+        const workflowRules = gitlabData.workflow?.rules;
+        if (workflowRules) {
+            const globalVars = gitlabData.variables ?? {};
+            const workflowVariables = {...predefinedVariables, ...globalVars, ...envMatchedVariables, ...argv.variable};
+            const ruleResult = Utils.getRulesResult({argv, cwd, rules: workflowRules, variables: workflowVariables}, gitData, "on_success");
+            if (ruleResult.variables) {
+                const normalizedRuleVars: {[key: string]: string} = {};
+                for (const [key, value] of Object.entries(ruleResult.variables)) {
+                    normalizedRuleVars[key] = Utils.normalizeVariables(value);
+                }
+                gitlabData.variables = {...globalVars, ...normalizedRuleVars};
+            }
+        }
+
+        assert(Array.isArray(gitlabData.stages), chalk`{yellow stages:} must be an array`);
         if (!gitlabData.stages.includes(".pre")) {
             gitlabData.stages.unshift(".pre");
         }
@@ -120,22 +156,19 @@ export class Parser {
 
         // Check job variables for invalid hash of key value pairs, and cast numbers to strings
         Utils.forEachRealJob(gitlabData, (jobName, jobData) => {
-            for (const [key, _value] of Object.entries(jobData.variables || {})) {
-                let value = _value;
-                if (value === null) value = ""; // variable's values are nullable
-                assert(
-                    typeof value === "string" || typeof value === "number",
-                    chalk`{blueBright ${jobName}} has invalid variables hash of key value pairs. ${key}=${value}`
-                );
-                jobData.variables[key] = String(value);
+            assert(jobData.when !== "never",
+                chalk`This GitLab CI configuration is invalid: jobs:${jobName} when:never can only be used in a rules section or workflow:rules`,
+            );
+            for (const [key, value] of Object.entries(jobData.variables ?? {})) {
+                jobData.variables[key] = Utils.normalizeVariables(value);
             }
 
             for (let i = 0; i < (jobData.services ?? []).length; i++) {
                 const service = jobData.services[i];
                 for (const [key, value] of Object.entries(service.variables || {})) {
                     assert(
-                        typeof value === "string" || typeof value === "number",
-                        chalk`{blueBright ${jobName}.services[${i}]} has invalid variables hash of key value pairs. ${key}=${value}`
+                        typeof value === "string" || typeof value === "number" || typeof value === "boolean",
+                        chalk`{blueBright ${jobName}.services[${i}]} has invalid variables hash of key value pairs. ${key}=${value}`,
                     );
                     jobData.services[i].variables[key] = String(value);
                 }
@@ -159,19 +192,31 @@ export class Parser {
                     matrixJobName = `${jobName}: [${nodeIndex}/${parallelMatrixVariablesList.length}]`;
                 }
 
+                // Resolve `$[[ matrix.X ]]` expressions in needs.parallel.matrix per-permutation
+                // (https://docs.gitlab.com/ci/yaml/matrix_expressions/). Each consumer permutation
+                // gets its own substituted needs so producers can be matched 1:1.
+                let permutationJobData = jobData;
+                if (jobData.needs && parallel.needsContainMatrixExpressions(jobData.needs) && !parallelMatrixVariables) {
+                    throw new AssertionError({message: chalk`{blueBright ${matrixJobName}} uses $[[ matrix.X ]] expressions in needs.parallel.matrix but is not parallelized with parallel:matrix`});
+                }
+                if (parallelMatrixVariables && jobData.needs?.some((n: any) => n.parallel?.matrix)) {
+                    const resolvedNeeds = parallel.resolveNeedsMatrixExpressions(jobData.needs, parallelMatrixVariables, matrixJobName);
+                    permutationJobData = {...jobData, needs: resolvedNeeds};
+                }
+
                 const job = new Job({
                     argv,
                     writeStreams,
-                    data: jobData,
+                    data: permutationJobData,
                     name: matrixJobName,
                     baseName: jobName,
                     globalVariables: gitlabData.variables,
                     pipelineIid: pipelineIid,
-                    predefinedVariables,
+                    predefinedVariables: {...predefinedVariables}, // NOTE: pass by value because predefinedVariables is mutated in the constructor
                     gitData,
                     variablesFromFiles,
                     matrixVariables: parallelMatrixVariables,
-                    nodeIndex: (jobData.parallel != null) ? nodeIndex : null,
+                    nodeIndex: (jobData.parallel == null) ? null : nodeIndex,
                     nodesTotal: parallelMatrixVariablesList.length,
                     expandVariables: this.expandVariables,
                 });
@@ -187,13 +232,13 @@ export class Parser {
         if (this.argv.maxJobNamePadding !== null && this.argv.maxJobNamePadding <= 0) {
             this._jobNamePad = 0;
         } else {
-            const jobs = this.argv.job.length !== 0 ? this.argv.job : this.jobs;
+            const jobs = this.argv.job.length === 0 ? this.jobs : this.argv.job;
             jobs.forEach((job) => {
                 let jobNeedsLength: number[] = [];
 
                 if (this.argv.needs && this.argv.job.length > 0) {
                     const found = this.jobs.find(j => j.baseName === job);
-                    if (found !== undefined && found.needs !== null) {
+                    if (found?.needs) {
                         jobNeedsLength = found.needs.map(f => f.job.length);
                     }
                 }
@@ -216,7 +261,25 @@ export class Parser {
         });
     }
 
-    static async loadYaml (filePath: string, ctx: any = {}, expandVariables: boolean = true): Promise<any> {
+    private async loadInputs (cwd: string, argv: Argv): Promise<{[key: string]: any}> {
+        const inputsFile = argv.inputsFile;
+        const inputsFilePath = path.isAbsolute(inputsFile) ? inputsFile : `${cwd}/${inputsFile}`;
+        let fileInputs: {[key: string]: any} = {};
+
+        if (fs.existsSync(inputsFilePath)) {
+            const content = await fs.readFile(inputsFilePath, "utf8");
+            try {
+                fileInputs = yaml.load(content) as {[key: string]: any} ?? {};
+            } catch (e: any) {
+                throw new Error(`Failed to parse inputs file ${inputsFilePath}: ${e.message}`, {cause: e});
+            }
+        }
+
+        const cliInput = argv.input;
+        return {_file: fileInputs, _cliGlobal: cliInput._global, _cliComponents: cliInput._components};
+    }
+
+    static async loadYaml (filePath: string, ctx: any = {}, expandVariables: boolean = true, writeStreams?: WriteStreams): Promise<any> {
         const ymlPath = `${filePath}`;
         if (!fs.existsSync(ymlPath)) {
             return {};
@@ -233,12 +296,16 @@ export class Parser {
         let index = 0;
         if (expandVariables) {
             for (const line of fileSplit) {
-                interactiveMatch = !interactiveMatch ? /#\s?@\s?[Ii]nteractive/.exec(line) : interactiveMatch;
-                injectSSHAgent = !injectSSHAgent ? /#\s?@\s?[Ii]njectSSHAgent/.exec(line) : injectSSHAgent;
-                noArtifactsToSourceMatch = !noArtifactsToSourceMatch ? /#\s?@\s?NoArtifactsToSource/i.exec(line) : noArtifactsToSourceMatch;
-                descriptionMatch = !descriptionMatch ? /#\s?@\s?[Dd]escription (?<description>.*)/.exec(line) : descriptionMatch;
+                if (/^\s*#/.test(line)) {
+                    interactiveMatch = interactiveMatch ?? /#\s?@\s?[Ii]nteractive/.exec(line);
+                    injectSSHAgent = injectSSHAgent ?? /#\s?@\s?[Ii]njectSSHAgent/.exec(line);
+                    noArtifactsToSourceMatch = noArtifactsToSourceMatch ?? /#\s?@\s?NoArtifactsToSource/i.exec(line);
+                    descriptionMatch = descriptionMatch ?? /#\s?@\s?[Dd]escription (?<description>.*)/.exec(line);
+                    index++;
+                    continue;
+                }
 
-                const jobMatch = /\w:/.exec(line);
+                const jobMatch = /^[^\s#].*:/.exec(line);
                 if (jobMatch && (interactiveMatch || descriptionMatch || injectSSHAgent || noArtifactsToSourceMatch)) {
                     if (interactiveMatch) {
                         fileSplitClone.splice(index + 1, 0, "  gclInteractive: true");
@@ -253,7 +320,7 @@ export class Parser {
                         index++;
                     }
                     if (descriptionMatch) {
-                        fileSplitClone.splice(index + 1, 0, `  gclDescription: ${descriptionMatch?.groups?.description ?? ""}`);
+                        fileSplitClone.splice(index + 1, 0, `  gclDescription: ${JSON.stringify(descriptionMatch?.groups?.description ?? "")}`);
                         index++;
                     }
                     interactiveMatch = null;
@@ -265,21 +332,23 @@ export class Parser {
             }
         }
 
-        const referenceType = new yaml.Type("!reference", {
-            kind: "sequence",
-            construct: function (data) {
-                return {referenceData: data};
+        const referenceType = yaml.defineSequenceTag<unknown[], {referenceData: unknown[]}>("!reference", {
+            create: () => [],
+            addItem: (carrier, item) => {
+                carrier.push(item);
             },
+            finalize: (carrier) => ({referenceData: carrier}),
+            identify: () => false,
         });
-        const schema = yaml.DEFAULT_SCHEMA.extend([referenceType]);
+        const schema = yaml.CORE_SCHEMA.withTags(yaml.mergeTag, yaml.timestampTag, yaml.binaryTag, yaml.omapTag, yaml.pairsTag, yaml.setTag, referenceType);
         let fileData;
 
         try {
-            fileData = yaml.loadAll(fileSplitClone.join("\n"), null, {schema}) as any[];
+            fileData = yaml.loadAll(fileSplitClone.join("\n"), {schema}) as any[];
         } catch (e: any) {
             if (e instanceof yaml.YAMLException && e.reason === "duplicated mapping key") {
-                console.log(chalk`{black.bgYellowBright  WARN } duplicated mapping key detected! Values will be overwritten!`);
-                fileData = yaml.loadAll(fileSplitClone.join("\n"), null, {schema, json: true}) as any[];
+                writeStreams?.stderr(chalk`{black.bgYellowBright  WARN } duplicated mapping key detected! Values will be overwritten!\n`);
+                fileData = yaml.loadAll(fileSplitClone.join("\n"), {schema, json: true}) as any[];
             } else {
                 throw e;
             }
@@ -290,31 +359,55 @@ export class Parser {
         if (isGitlabSpecFile(fileData[0])) {
             const inputsSpecification: any = fileData[0];
             const uninterpolatedConfigurations: any = fileData[1];
-
             const interpolatedConfigurations = JSON.stringify(uninterpolatedConfigurations)
-                .replace(
-                    /\$\[\[\s*inputs.(?<interpolationKey>[\w-]+)\s*\|?\s*(?<interpolationFunctions>.*?)\s*\]\]/g // regexr.com/7sh15
-                    , (_: string, interpolationKey: string, interpolationFunctions: string) => {
+                .replaceAll(
+                    /(?<firstChar>.)?(?<secondChar>.)?\$\[\[\s*inputs.(?<interpolationAccess>[^\s.|[\]](?:[^\]]|\](?!\]))*)\]\](?<lastChar>[^$])?/g
+                    , (_: string, firstChar: string, secondChar: string, interpolationAccess: string, lastChar: string) => {
                         const configFilePath = path.relative(process.cwd(), filePath);
+                        const interpolationKey = /^[^\s.|[\]]+/.exec(interpolationAccess)![0];
                         const context = {
                             interpolationKey,
-                            interpolationFunctions,
+                            interpolationFunctions: interpolationAccess.slice(interpolationKey.length).trim().replace(/^\|/, "").trim(),
                             inputsSpecification,
                             configFilePath,
+                            writeStreams,
                             ...ctx,
                         };
+                        firstChar ??= "";
+                        secondChar ??= "";
+                        lastChar ??= "";
 
-                        validateInterpolationKey(context);
-                        validateInterpolationFunctions(context);
-                        const inputValue = getInputValue(context);
-                        validateInput(inputValue, context);
+                        const {inputValue, inputType} = parseIncludeInputs(context);
+                        const firstTwoChar = firstChar + secondChar;
+                        switch (inputType) {
+                            case "array":
+                                if ((secondChar == "\"" && lastChar == "\"") && firstChar != "\\") {
+                                    return firstChar + JSON.stringify(inputValue);
+                                }
 
-                        const jsonValue = JSON.stringify(inputValue);
-                        // Unquote string if necessary
-                        if (typeof(jsonValue) == "string" && jsonValue.startsWith("\"") && jsonValue.endsWith("\"")) {
-                            return jsonValue.slice(1, -1);
+                                // NOTE: This behaves slightly differently from gitlab.com. I can't come up with practical use case so i don't think it's worth the effort to mimic this
+                                return firstTwoChar + JSON.stringify(JSON.stringify(inputValue)).slice(1, -1) + lastChar;
+                            case "string":
+                                return firstTwoChar +
+                                    JSON.stringify(inputValue) // ensure a valid json string
+                                        .slice(1, -1) + // remove the surrounding "
+                                    lastChar;
+
+                            case "number":
+                            case "boolean":
+                                if ((secondChar == "\"" && lastChar == "\"") && firstChar != "\\") {
+                                    return firstChar + inputValue;
+                                }
+                                return firstTwoChar + inputValue + lastChar;
+
+                            default:
+                                Utils.switchStatementExhaustiveCheck(inputType);
                         }
-                        return jsonValue;
+                    })
+                .replaceAll( // https://docs.gitlab.com/ci/components/#use-component-context-in-components
+                    /\$\[\[\s*component\.(?<interpolationKey>name|reference|version|sha)\s*\]\]/g // regexr.com/8lotc
+                    , (_: string, interpolationKey: string) => {
+                        return getComponentValue(filePath, ctx, interpolationKey) || _;
                     });
             return JSON.parse(interpolatedConfigurations);
         }
@@ -326,44 +419,94 @@ function isGitlabSpecFile (fileData: any) {
     return "spec" in fileData;
 }
 
-function validateInterpolationFunctions (ctx: any) {
-    const {interpolationFunctions, configFilePath} = ctx;
-    if (interpolationFunctions != "") {
-        console.log(chalk`{black.bgYellowBright  WARN } interpolation functions is currently not supported via gitlab-ci-local. Functions will just be a no-op.`);
-    }
-    assert(interpolationFunctions.split("|").length <= MAX_FUNCTIONS, chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: too many functions in interpolation block.`);
+function getComponentValue (filePath: string, ctx: any, interpolationKey: string) {
+    const {component} = ctx;
+    assert(component !== undefined, chalk`This GitLab CI configuration is invalid: \`{blueBright ${filePath}}\`: \`{blueBright component.${interpolationKey}}\` cannot be used outside a component.`);
+    return component[interpolationKey];
 }
 
-function getInputValue (ctx: any) {
-    const {inputs, interpolationKey, configFilePath, inputsSpecification} = ctx;
-    const inputValue = inputs[interpolationKey] || inputsSpecification.spec.inputs[interpolationKey]?.default;
-    assert(inputValue !== undefined, chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: required value has not been provided.`);
-    return inputValue;
-}
-
-function validateInterpolationKey (ctx: any): any {
+function validateInterpolationKey (ctx: any) {
     const {configFilePath, interpolationKey, inputsSpecification} = ctx;
     const invalidInterpolationKeyErr = chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: unknown interpolation key: \`${interpolationKey}\`.`;
     assert(inputsSpecification.spec.inputs?.[interpolationKey] !== undefined, invalidInterpolationKeyErr);
 }
 
-function validateInput (inputValue: any, ctx: any): any {
+function validateInterpolationFunctions (ctx: any) {
+    const {interpolationFunctions, configFilePath} = ctx;
+    if (interpolationFunctions != "") {
+        ctx.writeStreams?.stderr(chalk`{black.bgYellowBright  WARN } interpolation functions is currently not supported via gitlab-ci-local. Functions will just be a no-op.\n`);
+    }
+    assert(interpolationFunctions.split("|").length <= MAX_FUNCTIONS, chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: too many functions in interpolation block.`);
+}
+
+function validateInput (ctx: any) {
     const {configFilePath, interpolationKey, inputsSpecification} = ctx;
+    const inputValue = getInputValue(ctx);
+
+    const expectedInputType = getExpectedInputType(ctx);
+    assert(INCLUDE_INPUTS_SUPPORTED_TYPES.includes(expectedInputType),
+        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: header:spec:inputs:{blueBright ${interpolationKey}} input type unknown value: {blueBright ${expectedInputType}}.`);
+
+    const inputType = Array.isArray(inputValue) ? "array" : typeof inputValue;
+    assert(inputType === expectedInputType,
+        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: provided value is not a {blueBright ${expectedInputType}}.`);
 
     const options = inputsSpecification.spec.inputs[interpolationKey]?.options;
     if (options) {
-        assert(options.includes(inputValue),
-            chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: \`{blueBright ${inputValue}}\` cannot be used because it is not in the list of allowed options.`);
+        if (inputType == "array") {
+            for (const itemValue of inputValue) {
+                assert(options.includes(itemValue),
+                    chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: \`{blueBright ${itemValue}}\` cannot be used because it is not in the list of allowed options.`);
+            }
+        } else {
+            assert(options.includes(inputValue),
+                chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: \`{blueBright ${inputValue}}\` cannot be used because it is not in the list of allowed options.`);
+        }
     }
-
-    const type = inputsSpecification.spec.inputs[interpolationKey]?.type || "string";
-    assert(INCLUDE_INPUTS_SUPPORTED_TYPES.includes(type),
-        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: header:spec:inputs:{blueBright ${interpolationKey}} input type unknown value: {blueBright ${type}}.`);
-    assert(typeof inputValue == type,
-        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: provided value is not a {blueBright ${type}}.`);
 
     const regex = inputsSpecification.spec.inputs[interpolationKey]?.regex;
     if (regex) {
-        console.log(chalk`{black.bgYellowBright  WARN } spec:inputs:regex is currently not supported via gitlab-ci-local. This will just be a no-op.`);
+        let re: RE2JS;
+        try {
+            re = RE2JS.compile(regex);
+        } catch {
+            assert(false, chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: regex \`{blueBright ${regex}}\` is not a valid regular expression.`);
+        }
+        assert(re.test(String(inputValue)),
+            chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: \`{blueBright ${inputValue}}\` does not match required regex: {blueBright ${regex}}.`);
     }
+}
+
+function parseIncludeInputs (ctx: any): {inputValue: any; inputType: InputType} {
+    validateInterpolationKey(ctx);
+    validateInterpolationFunctions(ctx);
+    if (!ctx.skipInputValidation) validateInput(ctx);
+
+    const inputValue = getInputValue(ctx);
+    const inputType = ctx.skipInputValidation ? getActualInputType(inputValue, ctx) : getExpectedInputType(ctx);
+    return {inputValue, inputType};
+}
+
+function getActualInputType (inputValue: any, ctx: any): InputType {
+    const {configFilePath, interpolationKey} = ctx;
+    let inputType: string = Array.isArray(inputValue) ? "array" : typeof inputValue;
+    if (inputValue === null) {
+        inputType = "null";
+    }
+    assert(INCLUDE_INPUTS_SUPPORTED_TYPES.includes(inputType as InputType),
+        chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: provided value has unsupported type {blueBright ${inputType}}.`);
+    return inputType as InputType;
+}
+
+function getInputValue (ctx: any) {
+    const {inputs, interpolationKey, configFilePath, inputsSpecification} = ctx;
+    const inputValue = inputs?.[interpolationKey] ??
+        inputsSpecification.spec.inputs[interpolationKey]?.default;
+    assert(inputValue !== undefined, chalk`This GitLab CI configuration is invalid: \`{blueBright ${configFilePath}}\`: \`{blueBright ${interpolationKey}}\` input: required value has not been provided.`);
+    return inputValue;
+}
+
+function getExpectedInputType (ctx: any): InputType {
+    const {interpolationKey, inputsSpecification} = ctx;
+    return inputsSpecification.spec.inputs[interpolationKey]?.type || "string";
 }

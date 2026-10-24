@@ -22,18 +22,18 @@ test-job:
     - name: docker.io/library/alpine
       entrypoint: ["/bin/sh", "-c"]
       command: ["sh"]
-  image: docker.io/tutum/dnsutils
+  image: docker.io/massenz/dnsutils:2.4.0
   script: host docker.io-library-nginx
 
 build-job:
   stage: build
-  image: docker.io/tutum/dnsutils
+  image: docker.io/massenz/dnsutils:2.4.0
   script: host docker.io-library-nginx
 
 deploy-job:
   services: [docker.io/library/redis]
   stage: deploy
-  image: docker.io/tutum/dnsutils
+  image: docker.io/massenz/dnsutils:2.4.0
   script:
     - host docker.io-library-nginx && exit 1
     - host docker.io-library-redis
@@ -46,7 +46,7 @@ multiport-job:
       variables:
         MYSQL_ROOT_PASSWORD: secret
   stage: deploy
-  image: docker.io/tutum/dnsutils
+  image: docker.io/massenz/dnsutils:2.4.0
   script:
     - host docker.io-library-mysql
 
@@ -55,21 +55,21 @@ alias-job:
     - name: docker.io/library/redis
       alias: redis-alias
   stage: deploy
-  image: docker.io/tutum/dnsutils
+  image: docker.io/massenz/dnsutils:2.4.0
   script:
     - host docker.io-library-redis
     - host redis-alias
 
 alias-job-multiple-slashes:
   services:
-    - name: gcr.io/google-containers/redis
-      alias: redis-alias
+    - name: gcr.io/google-containers/pause:3.2
+      alias: pause-alias
   stage: deploy
-  image: docker.io/tutum/dnsutils
+  image: docker.io/massenz/dnsutils:2.4.0
   script:
-    - host gcr.io-google-containers-redis
-    - host gcr.io__google-containers__redis
-    - host redis-alias
+    - host gcr.io-google-containers-pause
+    - host gcr.io__google-containers__pause
+    - host pause-alias
 
 multie-job:
   services:
@@ -84,7 +84,7 @@ multie-job:
         ENV_TEST: Service 3
       entrypoint: ["/bin/sh", "-c"]
       command: ["echo $ENV_TEST"]
-  image: docker.io/tutum/dnsutils
+  image: docker.io/massenz/dnsutils:2.4.0
   script:
     - echo "Hello"
 
@@ -100,3 +100,23 @@ issue-904:
   services: !reference [.service-entry-ref]
   script:
     - echo "I shouldn't combust into flames"
+
+service-user:
+  services:
+    - name: docker.io/curlimages/curl:8.8.0
+      command: ["id", "-u"]
+  image: docker.io/library/alpine
+  script:
+    - echo "bye"
+
+registry-port:
+  services:
+    - registry-1.docker.io:443/library/nginx:1.29.7
+  image: docker.io/curlimages/curl:8.18.0
+  script: curl -sS http://registry-1.docker.io-library-nginx/
+
+image-digest:
+  services:
+    - docker.io/library/nginx@sha256:e7257f1ef28ba17cf7c248cb8ccf6f0c6e0228ab9c315c152f9c203cd34cf6d1
+  image: docker.io/curlimages/curl:8.18.0
+  script: curl -sS http://docker.io-library-nginx/

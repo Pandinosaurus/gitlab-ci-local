@@ -1,6 +1,6 @@
-import {GitData} from "../src/git-data";
-import {WriteStreamsMock} from "../src/write-streams";
-import {initSpawnSpy, initSpawnSpyReject} from "./mocks/utils.mock";
+import {GitData} from "../src/git-data.js";
+import {WriteStreamsMock} from "../src/write-streams.js";
+import {initSpawnSpy, initSpawnSpyReject} from "./mocks/utils.mock.js";
 
 
 const tests = [
@@ -35,6 +35,46 @@ const tests = [
         },
     },
     {
+        input: "http://example.com/vendor/package", // does not need to end with .git
+        expected: {
+            schema: "http",
+            port: "80",
+            host: "example.com",
+            group: "vendor",
+            project: "package",
+        },
+    },
+    {
+        input: "http://example.com/vendor/package/", // can end with /
+        expected: {
+            schema: "http",
+            port: "80",
+            host: "example.com",
+            group: "vendor",
+            project: "package",
+        },
+    },
+    {
+        input: "git@github.com:firecow/gitlab-ci.local.git", // project can contain .
+        expected: {
+            schema: "git",
+            port: "22",
+            host: "github.com",
+            group: "firecow",
+            project: "gitlab-ci.local",
+        },
+    },
+    {
+        input: "git@github.com:firecow/gitlab-ci-local", // does not need to end with .git
+        expected: {
+            schema: "git",
+            port: "22",
+            host: "github.com",
+            group: "firecow",
+            project: "gitlab-ci-local",
+        },
+    },
+    {
         input: "https://oauth2:glpat-qwerty12345@somegitlab.com/vendor/package.git",
         expected: {
             schema: "https",
@@ -46,6 +86,16 @@ const tests = [
     },
     {
         input: "https://oauth2:glpat-qwerty12345@somegitlab.com:8080/vendor/package.git",
+        expected: {
+            schema: "https",
+            port: "8080",
+            host: "somegitlab.com",
+            group: "vendor",
+            project: "package",
+        },
+    },
+    {
+        input: "https://username-with-dashes:glpat-qwerty12345@somegitlab.com:8080/vendor/package.git",
         expected: {
             schema: "https",
             port: "8080",
@@ -92,16 +142,16 @@ describe("initRemoteData", () => {
         test(t.input, async () => {
             const writeStreams = new WriteStreamsMock();
 
+            initSpawnSpy([{
+                cmdArgs: "git remote get-url origin".split(" "),
+                returnValue: {stdout: t.input},
+            }]);
             initSpawnSpyReject([{
                 cmdArgs: "git remote get-url gcl-origin".split(" "),
                 rejection: {
                     exitCode: 2,
                     stderr: "error: No such remote 'gcl-origin'",
                 },
-            }]);
-            initSpawnSpy([{
-                cmdArgs: "git remote get-url origin".split(" "),
-                returnValue: {stdout: t.input},
             }]);
 
             const {remote} = await GitData.init("tests", writeStreams);

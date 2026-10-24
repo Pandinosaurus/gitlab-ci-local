@@ -1,6 +1,6 @@
 export class Mutex {
 
-    private static locks = new Set();
+    private static readonly locks = new Set();
 
     private static async waitForLock (key: string) {
         return new Promise<void>((resolve) => {
@@ -16,8 +16,11 @@ export class Mutex {
     static async exclusive (key: string, cb: () => Promise<void>) {
         await Mutex.waitForLock(key);
         Mutex.locks.add(key);
-        await cb();
-        Mutex.locks.delete(key);
+        try {
+            await cb();
+        } finally {
+            Mutex.locks.delete(key);
+        }
     }
 
 }

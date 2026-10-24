@@ -1,8 +1,8 @@
 {
   "dependencies": {
-    "express": "^4.19.1"
+    "express": "^5.2.1"
   },
   "devDependencies": {
-    "npm-check-updates": "^10.2.5"
+    "npm-check-updates": "^18.0.1"
   }
 }

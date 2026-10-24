@@ -1,12 +1,12 @@
-import chalk from "chalk";
-import {Job} from "./job";
-import {Parser} from "./parser";
-import {Utils} from "./utils";
-import {WriteStreams} from "./write-streams";
-import {Executor} from "./executor";
+import chalk from "chalk-template";
+import {Job} from "./job.js";
+import {Parser} from "./parser.js";
+import {Utils} from "./utils.js";
+import {WriteStreams} from "./write-streams.js";
+import {Executor} from "./executor.js";
 import fs from "fs-extra";
-import {Argv} from "./argv";
-import {AssertionError} from "assert";
+import {Argv} from "./argv.js";
+import {AssertionError} from "node:assert";
 
 export class Commander {
 
@@ -72,9 +72,9 @@ export class Commander {
             throw new AssertionError({message: chalk`{blueBright ${jobArgs.join(",")}} could not be found`});
         }
 
-        const starters = argv.onlyNeeds
-            ? potentialStarters.filter(p => !jobArgs.includes(p.name))
-            : potentialStarters;
+        const starters = argv.onlyNeeds ?
+            potentialStarters.filter(p => !jobArgs.includes(p.name)) :
+            potentialStarters;
 
         await Executor.runLoop(argv, Array.from(jobSet), stages, starters);
         await Commander.printReport({
@@ -133,9 +133,12 @@ export class Commander {
 
         if (preScripts.successful.length !== 0) {
             preScripts.successful.sort((a, b) => stages.indexOf(a.stage) - stages.indexOf(b.stage));
-            preScripts.successful.forEach(({coveragePercent, name, prettyDuration}) => {
+            preScripts.successful.forEach(({argv, coveragePercent, name, prettyDuration}) => {
+                let prefix = "";
+                if (argv.childPipelineDepth > 0) prefix = `[${argv.variable.GCL_TRIGGERER}] -> `;
+
                 const namePad = name.padEnd(jobNamePad);
-                writeStreams.stdout(chalk`{black.bgGreenBright  PASS }${renderDuration(prettyDuration)} {blueBright ${namePad}}`);
+                writeStreams.stdout(chalk`{black.bgGreenBright  PASS }${renderDuration(prettyDuration)} {blueBright ${prefix}${namePad}}`);
                 if (coveragePercent) {
                     writeStreams.stdout(chalk` ${coveragePercent}% {grey coverage}`);
                 }
@@ -145,12 +148,12 @@ export class Commander {
 
         if (preScripts.warned.length !== 0) {
             preScripts.warned.sort((a, b) => stages.indexOf(a.stage) - stages.indexOf(b.stage));
-            for (const {name, prettyDuration} of preScripts.warned) {
+            const outputLogs = await Promise.all(preScripts.warned.map(({name}) => fs.readFile(`${cwd}/${stateDir}/output/${Utils.safeDockerString(name)}.log`, "utf8")));
+            for (const [index, {name, prettyDuration}] of preScripts.warned.entries()) {
                 const namePad = name.padEnd(jobNamePad);
-                const safeName = Utils.safeDockerString(name);
                 writeStreams.stdout(chalk`{black.bgYellowBright  WARN }${renderDuration(prettyDuration)} {blueBright ${namePad}}  pre_script\n`);
-                const outputLog = await fs.readFile(`${cwd}/${stateDir}/output/${safeName}.log`, "utf8");
-                for (const line of outputLog.split(/\r?\n/).filter(j => !j.includes("[32m$ ")).filter(j => j !== "").slice(-3)) {
+                // eslint-disable-next-line no-control-regex
+                for (const line of outputLogs[index].split(/\r?\n/).filter(j => !j.replaceAll(/\x1b\[[\d;]*m/g, "").startsWith("$ ")).filter(j => j !== "").slice(-3)) {
                     writeStreams.stdout(chalk`  {yellow >} ${line}\n`);
                 }
             }
@@ -166,12 +169,12 @@ export class Commander {
 
         if (preScripts.failed.length !== 0) {
             preScripts.failed.sort((a, b) => stages.indexOf(a.stage) - stages.indexOf(b.stage));
-            for (const {name, prettyDuration} of preScripts.failed) {
+            const outputLogs = await Promise.all(preScripts.failed.map(({name}) => fs.readFile(`${cwd}/${stateDir}/output/${Utils.safeDockerString(name)}.log`, "utf8")));
+            for (const [index, {name, prettyDuration}] of preScripts.failed.entries()) {
                 const namePad = name.padEnd(jobNamePad);
-                const safeName = Utils.safeDockerString(name);
                 writeStreams.stdout(chalk`{black.bgRed  FAIL }${renderDuration(prettyDuration)} {blueBright ${namePad}}\n`);
-                const outputLog = await fs.readFile(`${cwd}/${stateDir}/output/${safeName}.log`, "utf8");
-                for (const line of outputLog.split(/\r?\n/).filter(j => !j.includes("[32m$ ")).filter(j => j !== "").slice(-3)) {
+                // eslint-disable-next-line no-control-regex
+                for (const line of outputLogs[index].split(/\r?\n/).filter(j => !j.replaceAll(/\x1b\[[\d;]*m/g, "").startsWith("$ ")).filter(j => j !== "").slice(-3)) {
                     writeStreams.stdout(chalk`  {red >} ${line}\n`);
                 }
             }
@@ -208,6 +211,9 @@ export class Commander {
         let descriptionPadEnd = 11;
         jobs.forEach(j => descriptionPadEnd = Math.max(j.description.length, descriptionPadEnd));
 
+        let environmentPadEnd = 11;
+        jobs.forEach(j => environmentPadEnd = Math.max((j.environment?.name ?? "").length, environmentPadEnd));
+
         const jobNamePad = parser.jobNamePad;
 
         if (!listAll) {
@@ -216,15 +222,16 @@ export class Commander {
 
         writeStreams.stdout(chalk`{grey ${"name".padEnd(jobNamePad)}  ${"description".padEnd(descriptionPadEnd)}}  `);
         writeStreams.stdout(chalk`{grey ${"stage".padEnd(stagePadEnd)}  ${"when".padEnd(whenPadEnd)}}  `);
-        writeStreams.stdout(chalk`{grey allow_failure  needs}\n`);
+        writeStreams.stdout(chalk`{grey allow_failure  ${"environment".padEnd(environmentPadEnd)}  needs}\n`);
 
         const renderLine = (job: Job) => {
-            const needs = job.needs?.filter(n => !n.project && !n.pipeline).map(n => n.job);
-            const allowFailure = job.allowFailure ? "true " : "false";
+            const needs = Commander.formatNeeds(job);
+            const allowFailure = Commander.formatAllowFailure(job.allowFailure);
+            const environment = job.environment?.name ?? "";
             let jobLine = chalk`{blueBright ${job.name.padEnd(jobNamePad)}}  ${job.description.padEnd(descriptionPadEnd)}  `;
-            jobLine += chalk`{yellow ${job.stage.padEnd(stagePadEnd)}}  ${job.when.padEnd(whenPadEnd)}  ${allowFailure.padEnd(11)}`;
-            if (needs) {
-                jobLine += chalk`    [{blueBright ${needs}}]`;
+            jobLine += chalk`{yellow ${job.stage.padEnd(stagePadEnd)}}  ${job.when.padEnd(whenPadEnd)}  ${allowFailure.padEnd(13)}  ${environment.padEnd(environmentPadEnd)}`;
+            if (needs !== null) {
+                jobLine += chalk`  [{blueBright ${needs}}]`;
             }
             writeStreams.stdout(`${jobLine}\n`);
         };
@@ -244,6 +251,7 @@ export class Commander {
                 when: job.when,
                 allow_failure: job.allowFailure,
                 needs: job.needs?.filter(n => !n.project && !n.pipeline),
+                ...job.rules ? {rules: job.rules} : {},
             });
         });
 
@@ -261,11 +269,53 @@ export class Commander {
             jobs = jobs.filter(j => j.when !== "never");
         }
 
-        writeStreams.stdout("name;description;stage;when;allowFailure;needs\n");
+        writeStreams.stdout("name;stage;when;allowFailure;environment;needs\n");
+
         jobs.forEach((job) => {
-            const needs = job.needs?.filter(n => !n.project && !n.pipeline).map(n => n.job).join(",") ?? [];
-            writeStreams.stdout(`${job.name};"${job.description}";${job.stage};${job.when};${job.allowFailure};[${needs}]\n`);
+            const needs = Commander.formatNeeds(job);
+            const needsStr = needs === null ? "" : `[${needs.join(",")}]`;
+            const allowFailure = Commander.formatAllowFailure(job.allowFailure);
+            const environment = job.environment?.name ?? "";
+            const row = [job.name, job.stage, job.when, allowFailure, environment, needsStr].join(";");
+            writeStreams.stdout(`${row}\n`);
         });
     }
 
+    static validateDependencyChain (parser: Parser) {
+        const allJobs = parser.jobs;
+        // This is only the jobs that will actually run
+        const activeJobs = allJobs.filter(j => j.when !== "never");
+        // Validate considering all manual jobs that can be triggered are triggered.
+        const activeManualJobNames = activeJobs.filter(j => j.when === "manual").map(j => j.name);
+        const stages = parser.stages;
+        // This will throw an assertion errror if the dependency chain is broken due to needs keyword on specific events without having to run the full pipeline
+        Executor.getStartCandidates(allJobs, stages, activeJobs, activeManualJobNames);
+
+        const activeJobNames = new Set(activeJobs.map(job => job.name));
+        // This willl throw an assertion error if the dependency chain is broken due to dependencies keyword (a job depending on artifacts from a job that will never run) without having to run the full pipeline
+        for (const job of activeJobs) {
+            if (job.dependencies) {
+                for (const dependency of job.dependencies) {
+                    if (!activeJobNames.has(dependency)) {
+                        throw new AssertionError({message: chalk`{blueBright ${dependency}} is when:never, but its depended on by {blueBright ${job.name}}`});
+                    }
+                }
+            }
+        }
+    }
+
+    /** Returns `[code1,code2]` for exit_codes, `true`/`false` otherwise. */
+    private static formatAllowFailure (allowFailure: Job["allowFailure"]): string {
+        if (typeof allowFailure === "object") {
+            const codes = Array.isArray(allowFailure.exit_codes) ? allowFailure.exit_codes : [allowFailure.exit_codes];
+            return `[${codes.join(",")}]`;
+        }
+        return allowFailure ? "true" : "false";
+    }
+
+    /** Returns `[job1, job2]` when needs lists jobs, `[]` when explicitly set to no dependencies, or nothing when unset (job follows stage ordering). */
+    private static formatNeeds (job: Job): string[] | null {
+        if (job.needs === null) return null;
+        return job.needs.filter(n => !n.project && !n.pipeline).map(n => n.job);
+    }
 }

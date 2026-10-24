@@ -28,7 +28,9 @@ Get rid of all those dev specific shell scripts and make files.
     * [docker-in-docker with a local registry](./examples/docker-in-docker-build-with-local-registry)
 * [Installation](#installation)
 * [Convenience](#convenience)
-    * [CLI options via shell](#cli-options-via-shell)
+    * [CLI options](#cli-options)
+      * [Via a file](#via-a-file)
+      * [Via environment variables](#via-environment-variables)
     * [DotEnv file](#dotenv-file)
     * [Bash alias](#bash-alias)
     * [Tab completion](#tab-completion)
@@ -40,11 +42,13 @@ Get rid of all those dev specific shell scripts and make files.
     * [Remote File Variables](#remote-file-variables)
     * [Project File Variables](#project-file-variables)
     * [Decorators](#decorators)
+    * [CI/CD Inputs](#cicd-inputs)
     * [Includes](#includes)
     * [Artifacts](#artifacts)
+    * [Self Hosted Custom Ports](#self-hosted-custom-ports)
 * [Development](#development)
     * [Scripts](#scripts)
-    * [Package binaries](#package-binaries)
+* [Creating single executable binaries from source](#creating-single-executable-binaries-from-source)
 
 ## Installation
 
@@ -65,6 +69,16 @@ If your distribution does not support this, you can run these commands:
 ```bash
 curl -s "https://gitlab-ci-local-ppa.firecow.dk/pubkey.gpg" | sudo apt-key add -
 echo "deb https://gitlab-ci-local-ppa.firecow.dk ./" | sudo tee /etc/apt/sources.list.d/gitlab-ci-local.list
+
+# OR
+
+# MUST be `.asc` at least for older apts (e.g. Ubuntu Focal), since the key is ASCII-armored
+PPA_KEY_PATH=/etc/apt/sources.list.d/gitlab-ci-local-ppa.asc
+curl -s "https://gitlab-ci-local-ppa.firecow.dk/pubkey.gpg" | sudo tee "${PPA_KEY_PATH}"
+echo "deb [ signed-by=${PPA_KEY_PATH} ] https://gitlab-ci-local-ppa.firecow.dk ./" | sudo tee /etc/apt/sources.list.d/gitlab-ci-local.list
+
+# and then
+
 sudo apt-get update
 sudo apt-get install gitlab-ci-local
 ```
@@ -72,10 +86,24 @@ sudo apt-get install gitlab-ci-local
 Note that the path `/etc/apt/sources.list.d/gitlab-ci-local.list` is used in the file `gitlab-ci-local.list`.
 If you change it in these commands you must also change it in `/etc/apt/sources.list.d/gitlab-ci-local.list`.
 
+### Arch Linux
+
+`gitlab-ci-local` is available for Arch Linux through the [AUR](https://aur.archlinux.org/packages/gitlab-ci-local). Install with your favourite AUR helper.
+
+```
+paru -S gitlab-ci-local
+```
+
 ### NPM
 
 ```bash
 npm install -g gitlab-ci-local
+```
+
+### Bun
+
+```bash
+bun install -g gitlab-ci-local
 ```
 
 ### Macos
@@ -89,40 +117,38 @@ brew install gitlab-ci-local
 ### Windows (Git bash)
 
 - Install [gitbash](https://git-scm.com/downloads)
-- Install [rsync](https://prasaz.medium.com/add-rsync-to-windows-git-bash-f42736bae1b3)
+- Install [rsync](https://gist.github.com/radleta/0b337a2b14f761951cf2aab0578512b9)
 
 Download and put binary in `C:\Program Files\Git\mingw64\bin`
 
 ```bash
-curl -L https://github.com/firecow/gitlab-ci-local/releases/latest/download/win.gz | gunzip -c > /c/Program\ Files/Git/mingw64/bin/gitlab-ci-local.exe
+curl -L https://github.com/firecow/gitlab-ci-local/releases/latest/download/gitlab-ci-local-windows-amd64.zip -o gcl.zip && unzip -o gcl.zip -d /c/Program\ Files/Git/mingw64/bin && rm gcl.zip
 ```
 
 Executing `gitlab-ci-local` with `--variable MSYS_NO_PATHCONV=1` can be useful in certain situations
 
 ## Convenience
 
-### CLI options via shell
+### CLI options
+> [!NOTE]
+> Most likely [home-file-variables](https://github.com/firecow/gitlab-ci-local?tab=readme-ov-file#home-file-variables) or [project-file-variables](https://github.com/firecow/gitlab-ci-local?tab=readme-ov-file#project-file-variables) is what you're looking for instead
 
-```
-# Overrides .gitlab-ci.yml as the default git ci/cd file
-export GCL_NEEDS='true' >> ~/.bashrc
-export GCL_FILE='.gitlab-ci-local.yml' >> ~/.bashrc
-export GCL_VARIABLE="IMAGE=someimage SOMEOTHERIMAGE=someotherimage"
-```
+All cli options can be assigned default values by either of the following ways:
 
-### DotEnv file
-
-Add a `.gitlab-ci-local-env` file to the current working directory or a `.env` file in `$HOME/.gitlab-ci-local`
-
-```
-# Overrides .gitlab-ci.yml as the default git ci/cd file
-FILE=doctor-strange.yml # --file
-
-# Always runs needed jobs, when gitlab-ci-local <job-name> is called
-NEEDS=true # --needs
+#### Via environment variables
+```bash
+export GCL_NEEDS=true                   # --needs options
+export GCL_FILE='.gitlab-ci-local.yml'  # --file=.gitlab-ci-local.yml
 ```
 
-All cli options can be assigned default values this way
+#### Via a file
+```sh
+# Either of the following:
+# - `.gitlab-ci-local-env` in the current working directory
+# - `$HOME/.gitlab-ci-local/.env`
+NEEDS=true               # --needs
+FILE=doctor-strange.yml  # --file=doctor-strange.yml
+```
 
 ### Bash alias
 
@@ -133,7 +159,7 @@ echo "alias gcl='gitlab-ci-local'" >> ~/.bashrc
 ### Tab completion
 
 ```bash
-gitlab-ci-local --completion >> ~/.bashrc 
+gitlab-ci-local --completion >> ~/.bashrc
 ```
 
 ### Logging options
@@ -155,51 +181,61 @@ The command `gitlab-ci-local --list` will return pretty output and will also fil
 to `when: never`.
 
 ```text
-name        description  stage   when        allow_failure  needs
-test-job    Run Tests    test    on_success  false      
-build-job                build   on_success  true           [test-job]
+name            description  stage   when        allow_failure  needs
+test-job        Run Tests    test    on_success  false
+build-job                    build   on_success  true           [test-job]
+exit-codes-job               build   on_success  [42,137]       []
+deploy-job                   deploy  on_success  [1]
 ```
+
+- **description**: always shown, empty when not set
+- **allow_failure**: `true`, `false`, or `[exit_code1,exit_code2]` when specific exit codes are allowed to fail
+- **needs**: omitted when not specified (job follows stage ordering), `[]` when explicitly set to no dependencies (job starts immediately)
 
 #### --list-all
 
 Same as `--list` but will also print out jobs which are set to `when: never` (directly and implicit e.g. via rules).
 
 ```text
-name        description  stage   when        allow_failure  needs
-test-job    Run Tests    test    on_success  false      
-build-job                build   on_success  true           [test-job]
-deploy-job               deploy  never       false          [build-job]
+name            description  stage   when        allow_failure  needs
+test-job        Run Tests    test    on_success  false
+build-job                    build   on_success  true           [test-job]
+exit-codes-job               build   on_success  [42,137]       []
+deploy-job                   deploy  on_success  [1]
+never-job                    test    never       false
 ```
 
 #### --list-csv
 
-The command `gitlab-ci-local --list-csv` will output the pipeline jobs as csv formatted list and will also filter all
-jobs which are set
-to `when: never`.
-The description will always be wrapped in quotes (even if there is none) to prevent semicolons in the description
-disturb the csv structure.
+The command `gitlab-ci-local --list-csv` will output the pipeline jobs as a CSV-formatted list and will also filter all
+jobs which are set to `when: never`.
 
 ```text
-name;description;stage;when;allow_failure;needs
-test-job;"Run Tests";test;on_success;false;[]
-build-job;"";build;on_success;true;[test-job]
+name;stage;when;allowFailure;needs
+test-job;test;on_success;false;
+build-job;build;on_success;true;[test-job]
+exit-codes-job;build;on_success;[42,137];[]
+deploy-job;deploy;on_success;[1];
 ```
+
+- **allowFailure**: `true`, `false`, or `[exit_code1,exit_code2]` when specific exit codes are allowed to fail
+- **needs**: empty when not specified (job follows stage ordering), `[]` when explicitly set to no dependencies (job starts immediately)
 
 #### --list-csv-all
 
-Same as `--list-csv-all` but will also print out jobs which are set to `when: never` (directly and implicit e.g. via
+Same as `--list-csv` but will also print out jobs which are set to `when: never` (directly and implicit e.g. via
 rules).
 
 ```text
-name;description;stage;when;allow_failure;needs
-test-job;"Run Tests";test;on_success;false;[]
-build-job;"";build;on_success;true;[test-job]
-deploy-job;"";deploy;never;false;[build-job]
+name;stage;when;allowFailure;needs
+test-job;test;on_success;false;
+build-job;build;on_success;true;[test-job]
+exit-codes-job;build;on_success;[42,137];[]
+deploy-job;deploy;on_success;[1];
+never-job;test;never;false;
 ```
 
 ## Quirks
-
-git+http isn't properly supported https://github.com/firecow/gitlab-ci-local/issues/605 and has certain quirks
 
 ### Tracked Files
 
@@ -219,7 +255,7 @@ local-only-job:
 local-only-subsection:
   script:
     - if [ $GITLAB_CI == 'false' ]; then eslint . --fix; fi
-    - eslint . 
+    - eslint .
 ```
 
 ### Home file variables
@@ -260,23 +296,40 @@ Variables will now appear in your jobs, if project or group matches git remote, 
 
 ### Remote file variables
 
+You can also fetch variable files from remote git repositories. If you need multiple variable files, repeat the `--remote-variables` flag.
+
 ```shell
 gitlab-ci-local --remote-variables git@gitlab.com:firecow/example.git=gitlab-variables.yml=master
 ```
 
 ### Project file variables
 
-Put a file like this in `$CWD/.gitlab-ci-local-variables.yml`
+The `--variables-file` [default: $CWD/.gitlab-ci-local-variables.yml] can be used to setup the CI/CD variables for the executors
 
+#### `yaml` format
 ```yaml
 ---
 AUTHORIZATION_PASSWORD: djwqiod910321
 DOCKER_LOGIN_PASSWORD: dij3213n123n12in3
 # Will be type File, because value is a file path
 KNOWN_HOSTS: '~/.ssh/known_hosts'
+
+# This is only supported in the yaml format
+# https://docs.gitlab.com/ee/ci/environments/index.html#limit-the-environment-scope-of-a-cicd-variable
+EXAMPLE:
+  values:
+    "*": "I am only available in all jobs"
+    staging: "I am only available in jobs with `environment: staging`"
+    production: "I am only available in jobs with `environment: production`"
 ```
 
-Variables will now appear in your jobs.
+#### `.env` format
+```
+AUTHORIZATION_PASSWORD=djwqiod910321
+DOCKER_LOGIN_PASSWORD=dij3213n123n12in3
+# NOTE: value will be '~/.ssh/known_hosts' which is different behavior from the yaml format
+KNOWN_HOSTS='~/.ssh/known_hosts'
+```
 
 ### Decorators
 
@@ -339,9 +392,19 @@ A global configuration is possible when setting the following flag
 gitlab-ci-local --no-artifacts-to-source
 ```
 
+### CI/CD Inputs
+
+Input types, options, and regular expressions are validated by default. If an outdated component declares an input type that does not match its default or provided value, use `--skip-input-validation` to render the pipeline without these checks.
+
+```shell
+gitlab-ci-local --skip-input-validation --list
+```
+
+Required inputs and interpolation keys are still validated.
+
 ### Includes
 
-Includes from external sources are only fetched once. Use `--fetch-includes` to invoke an external fetching routine.
+Includes from external sources are only fetched once and cached. Use `--fetch-includes` to ensure that the latest external sources are always fetched.
 
 ### Artifacts
 
@@ -350,35 +413,52 @@ handling for shell jobs.
 
 Docker executor copies artifacts to and from .gitlab-ci-local/artifacts
 
+### Self Hosted Custom Ports
+
+If your self-hosted GitLab instance uses custom ports, it is recommended to manually define the `CI_SERVER_PORT` and/or `CI_SERVER_SHELL_SSH_PORT` variables accordingly.
+
+```yaml
+---
+# $CWD/.gitlab-ci-local-variables.yml
+
+CI_SERVER_PORT: 8443
+CI_SERVER_SHELL_SSH_PORT: 8022
+```
+
+### Special variables
+- `GCL_PROJECT_DIR_ON_HOST` Absolute path to gitlab-ci-local current working directory on the host machine. Use in docker-executor jobs only.
+
 ## Development
 
-You need nodejs 18+
+You need [bun](https://bun.sh/) installed.
 
 ### Scripts
 
 ```bash
-# Install node_modules
-npm install
-
-# Compiled typescript to javascript
-npm run build
+# Install dependencies
+bun install
 
 # Run all tests
-npm run test
+bun run test
 
 # Run individual test-case
-npx jest tests/test-cases/cache-paths-not-array
+bunx vitest run tests/test-cases/cache-paths-not-array
 ```
 
 ![example](./docs/images/example.png)
 
-It's also possible to run individual `.gitlab-ci.yml`, via `node src/index.js --cwd examples/docker-compose-nodejs`
+It's also possible to run individual `.gitlab-ci.yml`, via `bun src/index.ts --cwd examples/docker-compose-nodejs`
 
-### Package binaries
-
+## Creating single executable binaries from source
 ```bash
-npm run pkg-linux
-npm run pkg-win
-npm run pkg-macos
-npm run pkg-all
+bun install
+
+# According to your needs:
+bun build:linux-amd64
+bun build:linux-arm64
+bun build:win
+bun build:macos-x64
+bun build:macos-arm64
+bun build-all
+# the binary will be generated in the respective ./bin/<os>/gitlab-ci-local
 ```

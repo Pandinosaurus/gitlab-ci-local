@@ -1,22 +1,30 @@
-import assert from "assert";
-import * as fs from "fs-extra";
+import assert from "node:assert";
+import fs from "fs-extra";
 import * as dotenv from "dotenv";
-import * as path from "path";
+import * as path from "node:path";
 import camelCase from "camelcase";
-import {Utils} from "./utils";
-import {WriteStreams} from "./write-streams";
-import chalk from "chalk";
+import {Utils} from "./utils.js";
+import {WriteStreams} from "./write-streams.js";
+import chalkBase from "chalk";
+import chalk from "chalk-template";
 
+export function splitSemicolonEnvVars (argv: Record<string, any>, arrayKeys: Set<string>, env: Record<string, string | undefined>): void {
+    for (const [envKey, envValue] of Object.entries(env)) {
+        if (!envKey.startsWith("GCL_") || envValue == null) continue;
+        const optionName = camelCase(envKey.slice(4));
+        if (!arrayKeys.has(optionName)) continue;
+        const currentVal = argv[optionName];
+        if (!Array.isArray(currentVal) || currentVal.length !== 1 || currentVal[0] !== envValue) continue;
+        argv[optionName] = envValue.split(";");
+    }
+}
 
 async function isInGitRepository () {
     try {
         await Utils.spawn(["git", "rev-parse", "--is-inside-work-tree"]);
         return true;
-    } catch (err: any) {
-        if (err.stderr === "fatal: not a git repository (or any of the parent directories): .git") {
-            return false;
-        }
-        throw err;
+    } catch {
+        return false;
     }
 }
 
@@ -25,10 +33,42 @@ async function gitRootPath () {
     return stdout;
 }
 
-export class Argv {
+const GCL_VARIABLE_PREFIX = "GCL_VARIABLE_";
 
-    private map: Map<string, any> = new Map<string, any>();
-    private writeStreams: WriteStreams | undefined;
+// Removes GCL_VARIABLE_* entries from env (mutates) and returns the removed entries
+export function stripGclVariableEnvVars (env: Record<string, string | undefined>): Record<string, string> {
+    const stripped: Record<string, string> = {};
+    for (const key of Object.keys(env)) {
+        if (!key.startsWith(GCL_VARIABLE_PREFIX) || env[key] == null) continue;
+        if (key.length > GCL_VARIABLE_PREFIX.length) {
+            stripped[key] = env[key]!;
+        }
+        delete env[key];
+    }
+    return stripped;
+}
+
+// Prepends env vars so CLI --variable (later in array) takes precedence via last-wins
+export function injectGclVariableEnvVars (argv: {variable?: string[]; [key: string]: unknown}, gclVars: Record<string, string>): void {
+    for (const [envKey, envValue] of Object.entries(gclVars)) {
+        const varName = envKey.slice(GCL_VARIABLE_PREFIX.length);
+        argv.variable ??= [];
+        argv.variable.unshift(`${varName}=${envValue}`);
+    }
+}
+
+export class Argv {
+    static readonly default = {
+        "variablesFile": ".gitlab-ci-local-variables.yml",
+        "ignoresFile": ".gitlab-ci-local-ignores",
+        "inputsFile": ".gitlab-ci-local-inputs.yml",
+        "evaluateRuleChanges": true,
+        "ignoreSchemaPaths": [] as string[],
+        "ignorePredefinedVars": [] as string[],
+    };
+
+    map: Map<string, any> = new Map<string, any>();
+    private readonly writeStreams: WriteStreams | undefined;
 
     private async fallbackCwd (args: any) {
         if (args.cwd !== undefined || args.file !== undefined) return;
@@ -41,38 +81,76 @@ export class Argv {
 
     static async build (args: any, writeStreams?: WriteStreams) {
         const argv = new Argv(args, writeStreams);
-        await argv.init(args);
+        await argv.fallbackCwd(args);
+
+        argv.injectDotenv(`${argv.home}/.gitlab-ci-local/.env`, args);
+        argv.injectDotenv(`${argv.cwd}/.gitlab-ci-local-env`, args);
+
+        if (!argv.shellExecutorNoImage && argv.shellIsolation) {
+            writeStreams?.stderr(chalk`{black.bgYellowBright  WARN } --shell-isolation does not work with --no-shell-executor-no-image\n`);
+        }
+
+        if (argv.defaultImageExplicitlySet && argv.shellIsolation) {
+            writeStreams?.stderr(chalk`{black.bgYellowBright  WARN } --default-image does not work with --shell-isolation=true\n`);
+        }
+
+        if (argv.defaultImageExplicitlySet && argv.shellExecutorNoImage) {
+            writeStreams?.stderr(chalk`{black.bgYellowBright  WARN } --default-image does not work with --shell-executor-no-image=true\n`);
+        }
+
+        if (argv.defaultImageExplicitlySet && argv.forceShellExecutor) {
+            writeStreams?.stderr(chalk`{black.bgYellowBright  WARN } --default-image does not work with --force-shell-executor=true\n`);
+        }
+
         return argv;
     }
 
-    async init (args: any) {
-        await this.fallbackCwd(args);
-    }
-
     private constructor (argv: any, writeStreams?: WriteStreams) {
+        if (argv.noColor || argv.color === false || (process.env.NO_COLOR ?? "") !== "") {
+            chalkBase.level = 0;
+        }
         this.writeStreams = writeStreams;
         for (const [key, value] of Object.entries(argv)) {
             this.map.set(key, value);
         }
-
-        this.injectDotenv(`${this.home}/.gitlab-ci-local/.env`, argv);
-        this.injectDotenv(`${this.cwd}/.gitlab-ci-local-env`, argv);
-
-        if (!this.shellExecutorNoImage && this.shellIsolation) {
-            this.writeStreams?.stderr(chalk`{black.bgYellowBright  WARN } --shell-isolation does not work with --no-shell-executor-no-image\n`);
-        }
     }
 
     private injectDotenv (potentialDotenvFilepath: string, argv: any) {
-        if (fs.existsSync(potentialDotenvFilepath)) {
-            const config = dotenv.parse(fs.readFileSync(potentialDotenvFilepath));
-            for (const [key, value] of Object.entries(config)) {
-                const argKey = camelCase(key);
-                if (argv[argKey] == null) {
-                    this.map.set(argKey, value);
+        if (!fs.existsSync(potentialDotenvFilepath)) return;
+
+        const config = dotenv.parse(fs.readFileSync(potentialDotenvFilepath));
+        for (const [key, value] of Object.entries(config)) {
+            const argKey = camelCase(key);
+
+            // variable is additive — merge dotenv values with CLI values
+            if (argKey === "variable") {
+                let currentVal = argv[argKey];
+                if (currentVal == null) {
+                    currentVal = [];
+                    this.map.set(argKey, currentVal);
                 }
+                if (!Array.isArray(currentVal)) {
+                    continue;
+                }
+                for (const pair of value.split(" ")) {
+                    currentVal.unshift(pair);
+                }
+            } else if (argv[argKey] == null) {
+                // Work around `dotenv.parse` limitation https://github.com/motdotla/dotenv/issues/51#issuecomment-552559070
+                if (value === "true") this.map.set(argKey, true);
+                else if (value === "false") this.map.set(argKey, false);
+                else if (value === "null") this.map.set(argKey, null);
+                else if (Number.isFinite(Number(value))) this.map.set(argKey, Number(value));
+                else this.map.set(argKey, value);
             }
         }
+    }
+
+    private getStringArray (key: string): string[] {
+        const val = this.map.get(key) ?? [];
+        if (Array.isArray(val)) return val;
+        if (typeof val === "string") return val.split(" ");
+        return [];
     }
 
     get cwd (): string {
@@ -83,6 +161,26 @@ export class Argv {
         cwd = cwd.replace(/\/$/, "");
         assert(fs.pathExistsSync(cwd), `${cwd} is not a directory`);
         return cwd;
+    }
+
+    get variablesFile (): string {
+        return this.map.get("variablesFile") ?? Argv.default.variablesFile;
+    }
+
+    get inputsFile (): string {
+        return this.map.get("inputsFile") ?? Argv.default.inputsFile;
+    }
+
+    get skipInputValidation (): boolean {
+        return this.map.get("skipInputValidation") ?? false;
+    }
+
+    get ignoresFile (): string {
+        return this.map.get("ignoresFile") ?? Argv.default.ignoresFile;
+    }
+
+    get evaluateRuleChanges (): boolean {
+        return this.map.get("evaluateRuleChanges") ?? Argv.default.evaluateRuleChanges;
     }
 
     get file (): string {
@@ -97,50 +195,90 @@ export class Argv {
         return (this.map.get("home") ?? process.env.HOME ?? "").replace(/\/$/, "");
     }
 
-    get volume (): string[] {
-        const val = this.map.get("volume") ?? [];
-        return typeof val == "string" ? val.split(" ") : val;
+    get volume (): string[] { return this.getStringArray("volume"); }
+
+    get network (): string[] { return this.getStringArray("network"); }
+
+    get extraHost (): string[] { return this.getStringArray("extraHost"); }
+
+    get seccomp (): string | null { return this.map.get("seccomp") ?? null; }
+
+    get caFile (): string | null {
+        return this.map.get("caFile") ?? null;
     }
 
-    get network (): string[] {
-        const val = this.map.get("network") ?? [];
-        return typeof val == "string" ? val.split(" ") : val;
+    get ignoreSchemaPaths (): string[] {
+        return this.map.get("ignoreSchemaPaths") ?? Argv.default.ignoreSchemaPaths;
     }
 
-    get extraHost (): string[] {
-        const val = this.map.get("extraHost") ?? [];
-        return typeof val == "string" ? val.split(" ") : val;
+    get ignorePredefinedVars (): string[] {
+        const val = this.map.get("ignorePredefinedVars");
+        if (Array.isArray(val)) return val;
+        if (typeof val === "string" && val.length > 0) return val.split(",");
+        return Argv.default.ignorePredefinedVars;
     }
 
     get pullPolicy (): string {
         return this.map.get("pullPolicy") ?? "if-not-present";
     }
 
-    get remoteVariables (): string {
-        return this.map.get("remoteVariables");
-    }
+    get remoteVariables (): string[] { return this.getStringArray("remoteVariables"); }
 
     get variable (): {[key: string]: string} {
-        const val = this.map.get("variable");
         const variables: {[key: string]: string} = {};
+        for (const pair of this.getStringArray("variable")) {
+            const eqIndex = pair.indexOf("=");
+            if (eqIndex < 1) continue;
+            const key = pair.substring(0, eqIndex);
+            if (/^\w+$/.test(key)) {
+                variables[key] = pair.substring(eqIndex + 1);
+            }
+        }
+        return variables;
+    }
+
+    get input (): {_global: {[key: string]: any}; _components: {[key: string]: {[key: string]: any}}} {
+        const val = this.map.get("input");
+        const _global: {[key: string]: any} = {};
+        const _components: {[key: string]: {[key: string]: any}} = {};
         const pairs = typeof val == "string" ? val.split(" ") : val;
-        (pairs ?? []).forEach((variablePair: string) => {
-            const exec = /(?<key>\w*?)(=)(?<value>.*)/.exec(variablePair);
+        const dangerousKeys = new Set(["__proto__", "constructor", "prototype"]);
+        (pairs ?? []).forEach((inputPair: string) => {
+            // Support component-specific syntax: component:key=value or key=value
+            // Component names may contain word chars, hyphens, and slashes (e.g. templates/deploy)
+            const exec = /(?<![\w-])(?:(?<!\/)(?<component>[\w\-/]+):)?(?<key>[\w-]+)(=)(?<value>(.|\n|\r)*)/.exec(inputPair);
             if (exec?.groups?.key) {
-                variables[exec.groups.key] = exec?.groups?.value;
+                const value = exec?.groups?.value;
+                const key = exec.groups.key;
+                const component = exec.groups.component;
+
+                // Guard against prototype pollution
+                if (dangerousKeys.has(key) || dangerousKeys.has(component ?? "")) return;
+
+                // Try to parse as JSON for arrays/objects/booleans/numbers
+                let parsedValue;
+                try {
+                    parsedValue = JSON.parse(value);
+                } catch {
+                    parsedValue = value;
+                }
+
+                if (component) {
+                    if (!_components[component]) _components[component] = {};
+                    _components[component][key] = parsedValue;
+                } else {
+                    _global[key] = parsedValue;
+                }
             }
         });
-        return variables;
+        return {_global, _components};
     }
 
     get unsetVariables (): string[] {
         return this.map.get("unsetVariable") ?? [];
     }
 
-    get manual (): string[] {
-        const val = this.map.get("manual") ?? [];
-        return typeof val == "string" ? val.split(" ") : val;
-    }
+    get manual (): string[] { return this.getStringArray("manual"); }
 
     get job (): string[] {
         return this.map.get("job") ?? [];
@@ -159,17 +297,28 @@ export class Argv {
     }
 
     get umask (): boolean {
+        // TODO: default to false in 5.x.x
         return this.map.get("umask") ?? true;
+    }
+
+    get userns (): string | undefined {
+        return this.map.get("userns");
     }
 
     get privileged (): boolean {
         return this.map.get("privileged") ?? false;
     }
 
+    get device (): string[] { return this.getStringArray("device"); }
+
     get ulimit (): string | null {
         const ulimit = this.map.get("ulimit");
         if (!ulimit) return null;
         return ulimit;
+    }
+
+    get shmSize (): string | undefined {
+        return this.map.get("shmSize");
     }
 
     get needs (): boolean {
@@ -212,7 +361,12 @@ export class Argv {
         return this.map.get("preview") ?? false;
     }
 
+    get validateDependencyChain (): boolean {
+        return this.map.get("validateDependencyChain") ?? false;
+    }
+
     get shellIsolation (): boolean {
+        // TODO: default to true in 5.x.x
         return this.map.get("shellIsolation") ?? false;
     }
 
@@ -225,6 +379,7 @@ export class Argv {
     }
 
     get artifactsToSource (): boolean {
+        // TODO: default to false in 5.x.x
         return this.map.get("artifactsToSource") ?? true;
     }
 
@@ -244,22 +399,63 @@ export class Argv {
         return this.map.get("containerEmulate") ?? null;
     }
 
+    get gpus (): string | null {
+        return this.map.get("gpus") ?? null;
+    }
+
     get concurrency (): number | null {
-        const concurrency = this.map.get("concurrency");
-        if (!concurrency) return null;
-        return Number(concurrency);
+        const concurrency = Number(this.map.get("concurrency") ?? 0);
+        if (concurrency === 0) return null;
+        assert(Number.isInteger(concurrency) && concurrency > 0, "--concurrency must be a positive integer");
+        return concurrency;
     }
 
     get containerExecutable (): string {
         return this.map.get("containerExecutable") ?? "docker";
     }
 
-    get enableJsonSchemaValidation (): boolean {
-        return this.map.get("enableJsonSchemaValidation") ?? true;
+    get jsonSchemaValidation (): boolean {
+        return this.map.get("jsonSchemaValidation") ?? true;
     }
 
     get shellExecutorNoImage (): boolean {
         // TODO: default to false in 5.x.x
         return this.map.get("shellExecutorNoImage") ?? true;
+    }
+
+    get forceShellExecutor (): boolean {
+        return this.map.get("forceShellExecutor") ?? false;
+    }
+
+    get defaultImage (): string {
+        return this.map.get("defaultImage") ?? "docker.io/ruby:3.1";
+    }
+
+    get waitImage (): string {
+        return this.map.get("waitImage") ?? "docker.io/sumina46/wait-for-it:latest";
+    }
+
+    get waitForServicesTimeout (): number {
+        return this.map.get("waitForServicesTimeout") ?? 30;
+    }
+
+    get helperImage (): string {
+        return this.map.get("helperImage") ?? "docker.io/firecow/gitlab-ci-local-util:latest";
+    }
+
+    get defaultImageExplicitlySet (): boolean {
+        return this.map.get("defaultImage") ?? false;
+    }
+
+    get maximumIncludes (): number {
+        return this.map.get("maximumIncludes") ?? 150; // https://docs.gitlab.com/ee/administration/settings/continuous_integration.html#maximum-includes
+    }
+
+    get childPipelineDepth (): number {
+        return this.map.get("childPipelineDepth");
+    }
+
+    get registry (): boolean {
+        return this.map.get("registry") ?? false;
     }
 }

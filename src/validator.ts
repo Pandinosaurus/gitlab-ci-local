@@ -1,27 +1,53 @@
 import Ajv from "ajv";
-import {Job} from "./job";
-import assert from "assert";
-import chalk from "chalk";
-import * as yaml from "js-yaml";
-import addFormats from "ajv-formats";
-import schema from "./schema";
+import {Job} from "./job.js";
+import assert from "node:assert";
+import chalk from "chalk-template";
+import schema from "./schema.js";
+import {betterAjvErrors} from "./schema-error.js";
+import terminalLink from "terminal-link";
+import {Argv} from "./argv.js";
+
+const MAX_ERRORS = 5;
 
 export class Validator {
-    static jsonSchemaValidation (data: any) {
+    static jsonSchemaValidation ({pathToExpandedGitLabCi, gitLabCiConfig, argv}: {
+        pathToExpandedGitLabCi: string;
+        gitLabCiConfig: object;
+        argv: Argv;
+    }) {
         const ajv = new Ajv({
             verbose: true,
             allErrors: true,
             allowUnionTypes: true,
+            validateFormats: false,
             strictTypes: false, // to suppress the missing types defined in the gitlab-ci json schema
+            keywords: ["markdownDescription"],
         });
-        ajv.addKeyword("markdownDescription");
-        addFormats(ajv);
         const validate = ajv.compile(schema);
-        const valid = validate(data);
-        assert(valid,
-            chalk`Invalid gitlab-ci configuration! It have failed the json schema validation. Dump the following to the pipeline editor to debug:
+        const valid = validate(gitLabCiConfig);
+        if (valid) return;
+        const betterErrors = betterAjvErrors({
+            data: gitLabCiConfig,
+            errors: validate.errors,
+        }).filter(betterError => !argv.ignoreSchemaPaths.includes(betterError.schemaPath));
 
-${yaml.dump(data)}
+        let e: string = "";
+        for (let i = 0, len = betterErrors.length; i < len; i++) {
+            if (i + 1 > MAX_ERRORS) {
+                e += `\t... and ${len - MAX_ERRORS} more`;
+                break;
+            }
+            e += chalk`\t• {redBright ${betterErrors[i].message}} at {blueBright ${betterErrors[i].path}} {grey [${betterErrors[i].schemaPath}]}\n`;
+        }
+
+        assert(valid || betterErrors.length == 0, chalk`
+{reset Invalid .gitlab-ci.yml configuration!
+${e.trimEnd()}
+
+For further troubleshooting, consider either of the following:
+\t• Copy the content of {blueBright ${terminalLink(".gitlab-ci-local/expanded-gitlab-ci.yml", pathToExpandedGitLabCi)}} to the ${terminalLink("pipeline editor", "https://docs.gitlab.com/ee/ci/pipeline_editor/")} to debug it
+\t• Use --ignore-schema-paths "#/definitions/tags/minItems" --ignore-schema-paths "#/additionalProperties" to partially disable certain validation rule
+\t• Use --json-schema-validation=false to disable schema validation (not recommended)}
 `);
     }
 
@@ -84,10 +110,33 @@ ${yaml.dump(data)}
         }
     }
 
+    /**
+     * These jobs named are reserved keywords in GitLab CI but does not prevent the pipeline from running
+     * https://github.com/firecow/gitlab-ci-local/issues/1263
+     * @param jobsNames
+     * @private
+     */
+    private static potentialIllegalJobName (jobsNames: string[]) {
+        const warnings = [];
+        for (const jobName of jobsNames) {
+            if (new Set(["types", "true", "false", "nil"]).has(jobName)) {
+                warnings.push(`Job name "${jobName}" is a reserved keyword. (https://docs.gitlab.com/ee/ci/jobs/#job-name-limitations)`);
+            }
+        }
+        return warnings;
+    }
+
     private static scriptBlank (jobs: ReadonlyArray<Job>) {
         for (const job of jobs) {
             if (job.trigger) continue; // Jobs with trigger are allowed to have empty script
             assert(job.scripts.length > 0, chalk`{blue ${job.name}} has empty script`);
+        }
+    }
+
+    private static rulesBlank (jobs: ReadonlyArray<Job>) {
+        for (const job of jobs) {
+            if (!job.rules) continue;
+            assert(job.rules.length > 0, chalk`{blue ${job.name}} {yellow rules:} config can't be blank`);
         }
     }
 
@@ -100,13 +149,26 @@ ${yaml.dump(data)}
         }
     }
 
-    static async run (jobs: ReadonlyArray<Job>, stages: readonly string[]) {
-        const warnings: string[] = [];
+    static run (jobs: ReadonlyArray<Job>, stages: readonly string[]) {
         this.scriptBlank(jobs);
+        this.rulesBlank(jobs);
         this.arrayOfStrings(jobs);
-        warnings.push(...this.needs(jobs, stages));
         this.dependencies(jobs, stages);
         this.dependenciesContainment(jobs);
+        return [
+            ...this.needs(jobs, stages),
+            ...this.potentialIllegalJobName(jobs.map(j => j.baseName)),
+            ...this.artifacts(jobs),
+        ];
+    }
+
+    private static artifacts (jobs: ReadonlyArray<Job>) {
+        const warnings: string[] = [];
+        for (const job of jobs) {
+            if (job.artifacts === null) {
+                warnings.push(`${job.name}.artifacts is null, ignoring.`);
+            }
+        }
         return warnings;
     }
 }

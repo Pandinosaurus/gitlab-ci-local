@@ -1,0 +1,104 @@
+---
+stages:
+    - build
+    - test
+
+alpine-guest:
+    image: nginxinc/nginx-unprivileged:alpine3.18
+    needs: ["alpine-root"]
+    script:
+        - stat -c "%a %n %u %g" one.txt
+        - stat -c "%a %n %u %g" script.sh
+    rules:
+        - if: '$RUN_ALL == "true"'
+        - if: '$RUN_SINGLE == "alpine-root"'
+        - if: '$RUN_SINGLE == "alpine-guest"'
+
+alpine-root:
+    needs: ["kaniko-root"]
+    image: nginx:alpine3.18
+    rules:
+        - if: '$RUN_ALL == "true"'
+        - if: '$RUN_SINGLE == "alpine-root"'
+        - if: '$RUN_SINGLE == "alpine-guest"'
+          when: never
+    script:
+        - stat -c "%a %n %u %g" one.txt
+        - stat -c "%a %n %u %g" script.sh
+
+kaniko-root:
+    image:
+        name: gcr.io/kaniko-project/executor:v1.23.0-debug
+        entrypoint: [""]
+    rules:
+        - if: '$RUN_ALL == "true"'
+    script:
+        - stat -c "%a %n %u %g" one.txt
+        - stat -c "%a %n %u %g" script.sh
+
+
+kaniko-guest:
+    image:
+        name: gcr.io/kaniko-project/executor:v1.23.0-debug
+        entrypoint: [""]
+    rules:
+        - if: '$RUN_ALL == "true"'
+    script:
+        - stat -c "%a %n %u %g" one.txt
+        - stat -c "%a %n %u %g" script.sh
+
+
+build-job-1:
+    stage: build
+    script: echo "build 1"
+    artifacts:
+        paths: [build1.txt]
+    rules:
+        - if: '$RUN_ALL == "true"'
+        - if: '$TEST_DEPENDENCIES == "true"'
+
+
+test-job:
+    stage: test
+    dependencies: [build-job-1]
+    rules:
+        - if: '$RUN_ALL == "true"'
+    script: echo "testing"
+
+build-job-2:
+    stage: build
+    script: echo "build 2"
+    artifacts:
+        paths: [build2.txt]
+    rules:
+        - if: '$RUN_ALL == "true"'
+
+broken-dependencies-job:
+    stage: test
+    dependencies: [build-job-1, build-job-2]
+    rules:
+        - if: '$TEST_DEPENDENCIES == "true"'
+    script: echo "This has broken dependencies"
+
+manual-needed-job:
+    stage: build
+    script: echo "manual, only reachable on the valid event"
+    rules:
+        - if: '$TEST_MANUAL_NEEDS == "valid"'
+          when: manual
+
+manual-needs-unreachable-job:
+    stage: test
+    needs: [manual-needed-job]
+    script: echo "manual, but its need cannot run on this event"
+    rules:
+        - if: '$TEST_MANUAL_NEEDS == "broken"'
+          when: manual
+
+manual-needs-reachable-job:
+    stage: test
+    needs: [manual-needed-job]
+    script: echo "manual, and its need can be triggered too"
+    rules:
+        - if: '$TEST_MANUAL_NEEDS == "valid"'
+          when: manual

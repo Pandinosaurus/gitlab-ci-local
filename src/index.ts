@@ -1,39 +1,55 @@
 #!/usr/bin/env node
-import "source-map-support/register";
-import chalk from "chalk";
-import * as fs from "fs-extra";
-import * as path from "path";
+import chalk from "chalk-template";
 import yargs from "yargs";
-import {Parser} from "./parser";
-import * as state from "./state";
-import {WriteStreamsProcess, WriteStreamsMock} from "./write-streams";
-import {handler} from "./handler";
-import {Executor} from "./executor";
-import {Argv} from "./argv";
+import camelCase from "camelcase";
+import {splitSemicolonEnvVars} from "./argv.js";
+import {Parser} from "./parser.js";
+import * as state from "./state.js";
+import {WriteStreamsProcess, WriteStreamsMock} from "./write-streams.js";
+import {handler} from "./handler.js";
+import {Executor} from "./executor.js";
+import {Argv, stripGclVariableEnvVars, injectGclVariableEnvVars} from "./argv.js";
 import {AssertionError} from "assert";
-import {Job, cleanupJobResources} from "./job";
-import {GitlabRunnerPresetValues} from "./gitlab-preset";
+import {Job, cleanupJobResources} from "./job.js";
+import {GitlabRunnerPresetValues} from "./gitlab-preset.js";
+import packageJson from "../package.json";
+import http from "node:http";
+
+http.setGlobalProxyFromEnv?.();
 
 const jobs: Job[] = [];
 
-process.on("SIGINT", async (_: string, code: number) => {
-    await cleanupJobResources(jobs);
-    process.exit(code);
-});
+let cleanupAndExitPromise: Promise<void> | null = null;
+
+async function cleanupAndExit (code: number) {
+    // First caller's exit code wins — subsequent callers join the in-flight cleanup.
+    if (cleanupAndExitPromise) return cleanupAndExitPromise;
+    cleanupAndExitPromise = cleanupJobResources(jobs).finally(() => process.exit(code));
+    return cleanupAndExitPromise;
+}
+
+process.on("SIGINT", () => cleanupAndExit(130));
+process.on("SIGTERM", () => cleanupAndExit(143));
+process.on("SIGHUP", () => cleanupAndExit(129));
 
 // Graceful shutdown for nodemon
-process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
+process.on("SIGUSR2", async () => {
+    if (!cleanupAndExitPromise) await cleanupJobResources(jobs);
+});
 
 (() => {
-    const packageJson = JSON.parse(fs.readFileSync(path.join(__dirname, "../package.json"), "utf8"));
-    yargs(process.argv.slice(2))
-        .parserConfiguration({"greedy-arrays": false})
+    const gclVariableEnvVars = stripGclVariableEnvVars(process.env);
+    const yparser = yargs(process.argv.slice(2));
+    yparser.parserConfiguration({"greedy-arrays": false})
         .showHelpOnFail(false)
-        .version(packageJson["version"])
-        .wrap(yargs.terminalWidth())
+        .version(packageJson.version)
+        .wrap(yparser.terminalWidth?.())
         .command({
             handler: async (argv) => {
                 try {
+                    const arrayKeys = new Set((yparser as any).getOptions().array.map((k: string) => camelCase(k)) as string[]);
+                    splitSemicolonEnvVars(argv, arrayKeys, process.env);
+                    injectGclVariableEnvVars(argv, gclVariableEnvVars);
                     await handler(argv, new WriteStreamsProcess(), jobs);
                     const failedJobs = Executor.getFailed(jobs);
                     process.exit(failedJobs.length > 0 ? 1 : 0);
@@ -45,15 +61,22 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
                     } else {
                         process.stderr.write(chalk`{red ${e.stack ?? e}}\n`);
                     }
-                    await cleanupJobResources(jobs);
-                    process.exit(1);
+                    await cleanupAndExit(1);
                 }
             },
             builder: (y: any) => {
-                return y.positional("job", {
-                    describe: "Jobname's to execute",
-                    type: "array",
-                });
+                return y
+                    .positional("job", {
+                        describe: "Jobname's to execute",
+                        type: "string", // Type here is referring to each element of the positional args
+                    })
+                    // by default yargs's positional options (args) can be used as options (flags) so this coerce is solely for
+                    // handling scenario when a single --job option flag is passed
+                    // Once https://github.com/yargs/yargs/issues/2196 is implemented, we can probably remove this
+                    .coerce("job", (args: string[]) => {
+                        if (!Array.isArray(args)) return [args];
+                        return args;
+                    });
             },
             command: "$0 [job..]",
             describe: "Runs the entire pipeline or job's",
@@ -91,6 +114,11 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "List job information in csv format, when:never included",
             requiresArg: false,
         })
+        .option("validate-dependency-chain", {
+            type: "boolean",
+            description: "Validate that jobs needed or dependent by active jobs under specified conditions are also active without actually running the jobs. Validates the dependency graph for the given conditions rather than one specific run, so when:manual jobs count as active and --manual is ignored. Uses fail-fast approach - stops at first validation error for both 'needs' and 'dependencies' keywords. If validation fails, use --list flag to see which jobs will run under specified conditions",
+            requiresArg: false,
+        })
         .option("preview", {
             type: "boolean",
             description: "Print YML with defaults, includes, extends and reference's expanded",
@@ -101,10 +129,39 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "Path to a current working directory",
             requiresArg: true,
         })
+        .option("variables-file", {
+            type: "string",
+            description: "Path to the project file variables",
+            requiresArg: true,
+            default: Argv.default.variablesFile,
+        })
+        .option("inputs-file", {
+            type: "string",
+            description: "Path to the component inputs file",
+            requiresArg: true,
+            default: Argv.default.inputsFile,
+        })
+        .option("skip-input-validation", {
+            type: "boolean",
+            description: "Skip CI/CD input type, options, and regex validation",
+            requiresArg: false,
+        })
+        .option("ignores-file", {
+            type: "string",
+            description: "Path to an ignores file",
+            requiresArg: true,
+            default: Argv.default.ignoresFile,
+        })
         .option("completion", {
             type: "boolean",
             description: "Generate tab completion script",
             requiresArg: false,
+        })
+        .option("evaluate-rule-changes", {
+            type: "boolean",
+            description: "Whether to evaluate rule:changes. If set to false, rules:changes will always evaluate to true",
+            requiresArg: false,
+            default: Argv.default.evaluateRuleChanges,
         })
         .option("needs", {
             type: "boolean",
@@ -131,8 +188,13 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "Unsets a variable (--unset-variable HELLO)",
             requiresArg: false,
         })
+        .option("input", {
+            type: "array",
+            description: "Add input to component includes (--input KEY=value)",
+            requiresArg: false,
+        })
         .option("remote-variables", {
-            type: "string",
+            type: "array",
             description: "Fetch variables file from remote location",
             requiresArg: false,
         })
@@ -156,12 +218,35 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "Enable artifact isolation for shell-executor jobs",
             requiresArg: false,
         })
+        .option("force-shell-executor", {
+            type: "boolean",
+            description: "Forces all jobs to be executed using the shell executor. (Only use this option for trusted job)",
+            requiresArg: false,
+        })
         .option("shell-executor-no-image", {
             type: "boolean",
             description: "Whether to use shell executor when no image is specified.",
             requiresArg: false,
-            // TODO: default to false in 5.x.x
-            default: true,
+        })
+        .option("default-image", {
+            type: "string",
+            description: "When using --shell-executor-no-image=false which image to be used for the container. Defaults to docker.io/ruby:3.1 if not set.",
+            requiresArg: false,
+        })
+        .option("wait-image", {
+            type: "string",
+            description: "Which image to be used for the wait container. Defaults to docker.io/sumina46/wait-for-it:latest if not set.",
+            requiresArg: false,
+        })
+        .option("wait-for-services-timeout", {
+            type: "number",
+            description: "Timeout in seconds for service health checks. Defaults to 30.",
+            requiresArg: false,
+        })
+        .option("helper-image", {
+            type: "string",
+            description: "When using --shell-executor-no-image=false which image to be used for the utils container. Defaults to docker.io/firecow/gitlab-ci-local-util:latest if not set.",
+            requiresArg: false,
         })
         .option("mount-cache", {
             type: "boolean",
@@ -172,17 +257,30 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             type: "boolean",
             description: "Sets docker user to 0:0",
             requiresArg: false,
-            // TODO: default to false in 5.x.x
-            default: true,
+        })
+        .option("userns", {
+            type: "string",
+            description: "Set docker executor userns option",
+            requiresArg: false,
         })
         .option("privileged", {
             type: "boolean",
             description: "Set docker executor to privileged mode",
             requiresArg: false,
         })
+        .option("device", {
+            type: "array",
+            description: "Add devices to docker executor",
+            requiresArg: false,
+        })
         .option("ulimit", {
             type: "number",
             description: "Set docker executor ulimit",
+            requiresArg: false,
+        })
+        .option("shm-size", {
+            type: "string",
+            description: "Set docker executor shared memory size, docker default is 64m (e.g., '256m', '1g')",
             requiresArg: false,
         })
         .option("network", {
@@ -200,6 +298,16 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "Add extra docker host entries",
             requiresArg: false,
         })
+        .option("seccomp", {
+            type: "string",
+            description: "Set seccomp of container",
+            requiresArg: false,
+        })
+        .option("ca-file", {
+            type: "string",
+            description: "Path to custom CA certificate file to mount in containers",
+            requiresArg: false,
+        })
         .option("pull-policy", {
             type: "string",
             description: "Set image pull-policy (always or if-not-present)",
@@ -210,17 +318,20 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "Fetch all external includes one more time",
             requiresArg: false,
         })
+        .option("maximum-includes", {
+            type: "number",
+            description: "The maximum number of includes",
+            requiresArg: false,
+        })
         .option("artifacts-to-source", {
             type: "boolean",
             description: "Copy the generated artifacts into cwd",
             requiresArg: false,
-            default: true,
         })
         .option("cleanup", {
             type: "boolean",
             description: "Remove docker resources after they've been used",
             requiresArg: false,
-            default: true,
         })
         .option("quiet", {
             type: "boolean",
@@ -237,11 +348,22 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "Maximum padding for job name (use <= 0 for no padding)",
             requiresArg: false,
         })
-        .option("enable-json-schema-validation", {
+        .option("json-schema-validation", {
             type: "boolean",
             description: "Whether to enable json schema validation",
             requiresArg: false,
-            default: false,
+        })
+        .option("ignore-schema-paths", {
+            type: "array",
+            requiresArg: false,
+            default: Argv.default.ignoreSchemaPaths,
+            description: "The json schema paths that will be ignored",
+        })
+        .option("ignore-predefined-vars", {
+            type: "string",
+            coerce: (v) => v.split(","),
+            requiresArg: false,
+            describe: "Comma-seperated list of predefined pipeline variables for which warnings should be suppressed",
         })
         .option("concurrency", {
             type: "number",
@@ -263,20 +385,37 @@ process.on("SIGUSR2", async () => await cleanupJobResources(jobs));
             description: "The name, without the architecture, of a gitlab hosted runner to emulate. See here: https://docs.gitlab.com/ee/ci/runners/hosted_runners/linux.html#machine-types-available-for-linux---x86-64",
             choices: GitlabRunnerPresetValues,
         })
+        .option("gpus", {
+            type: "string",
+            description: "A list of GPU indexes or 'all'",
+            requiresArg: true,
+        })
+        .option("color", {
+            requiresArg: false,
+            default: true,
+            description: "Enables color",
+        })
+        .option("registry", {
+            type: "boolean",
+            requiresArg: false,
+            description: "Start a local docker registry and configure gitlab-ci-local containers to use that by default",
+        })
         .completion("completion", false, (current: string, yargsArgv: any, completionFilter: any, done: (completions: string[]) => any) => {
             try {
                 if (current.startsWith("-")) {
                     completionFilter();
                 } else {
+                    injectGclVariableEnvVars(yargsArgv, gclVariableEnvVars);
                     Argv.build({...yargsArgv, autoCompleting: true})
                         .then(argv => state.getPipelineIid(argv.cwd, argv.stateDir).then(pipelineIid => ({argv, pipelineIid})))
                         .then(({argv, pipelineIid}) => Parser.create(argv, new WriteStreamsMock(), pipelineIid, []))
                         .then((parser) => {
                             const jobNames = [...parser.jobs.values()].filter((j) => j.when != "never").map((j) => j.name);
                             done(jobNames);
-                        });
+                        })
+                        .catch(() => done(["Parser-Failed!"]));
                 }
-            } catch (e) {
+            } catch {
                 return ["Parser-Failed!"];
             }
 

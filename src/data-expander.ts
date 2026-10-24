@@ -1,9 +1,16 @@
-import chalk from "chalk";
-import deepExtend from "deep-extend";
-import assert, {AssertionError} from "assert";
-import {Job, Need} from "./job";
-import {traverse} from "object-traversal";
-import {Utils} from "./utils";
+import chalk from "chalk-template";
+import assert, {AssertionError} from "node:assert";
+import {Job, Need} from "./job.js";
+import {Utils} from "./utils.js";
+
+const isMergeable = (value: any) => value != null && Utils.isObject(value) && value.referenceData == null;
+const extendsMerge = (target: any, source: any): any => {
+    if (!isMergeable(target) || !isMergeable(source)) return structuredClone(source);
+    for (const [key, value] of Object.entries(source)) {
+        target[key] = extendsMerge(target[key], value);
+    }
+    return target;
+};
 
 const extendsMaxDepth = 11;
 const extendsRecurse = (gitlabData: any, jobName: string, jobData: any, parents: any[], depth: number) => {
@@ -12,8 +19,6 @@ const extendsRecurse = (gitlabData: any, jobName: string, jobData: any, parents:
 
     jobData.extends = typeof jobData.extends === "string" ? [jobData.extends] : jobData.extends;
     jobData.extends = jobData.extends ?? [];
-    reference(gitlabData, jobData.extends);
-    jobData.extends = jobData.extends.flat(5);
 
     for (const parentName of jobData.extends) {
         const parentData = gitlabData[parentName];
@@ -29,7 +34,7 @@ export function jobExtends (gitlabData: any) {
         if (Job.illegalJobNames.has(jobName)) continue;
         if (!Utils.isObject(jobData)) continue;
         const parentDatas = extendsRecurse(gitlabData, jobName, jobData, [], 0);
-        gitlabData[jobName] = deepExtend({}, ...parentDatas, jobData);
+        gitlabData[jobName] = [...parentDatas, jobData].reduce((mergedData, data) => extendsMerge(mergedData, data), {});
     }
 
     for (const [jobName, jobData] of Object.entries<any>(gitlabData)) {
@@ -42,7 +47,12 @@ export function jobExtends (gitlabData: any) {
 export function reference (gitlabData: any, recurseData: any) {
     for (const [key, value] of Object.entries<any>(recurseData || {})) {
         if (value?.referenceData) {
-            recurseData[key] = getSubDataByReference(gitlabData, value.referenceData);
+            if (Object.keys(value).length > 1) {
+                recurseData[key] = {...getSubDataByReference(gitlabData, value.referenceData), ...recurseData[key]};
+                delete recurseData[key].referenceData;
+            } else {
+                recurseData[key] = getSubDataByReference(gitlabData, value.referenceData);
+            }
         } else if (typeof value === "object") {
             reference(gitlabData, value);
         }
@@ -66,22 +76,42 @@ function hasCircularChain (data: any) {
     try {
         JSON.stringify(data);
     } catch (e) {
-        if (e instanceof TypeError && e.message.startsWith("Converting circular structure to JSON")) {
+        if (e instanceof TypeError && (e.message.startsWith("Converting circular structure") || e.message.includes("cyclic structures"))) {
             return true;
         }
     }
     return false;
 }
 
-export function complexObjects (gitlabData: any) {
+/**
+  Transform the globally defined ["image", "services", "cache", "before_script", "after_script"] into the default.x syntax
+  https://docs.gitlab.com/ee/ci/yaml/index.html#globally-defined-image-services-cache-before_script-after_script
+*/
+export function transformDeprecatedGlobalDefaultSyntax (gitlabData: any) {
+    const GITLAB_DEPRECATED_GLOBALLY_DEFINED_KEYWORDS = ["image", "services", "cache", "before_script", "after_script"];
+
+    gitlabData.default = gitlabData.default ?? {};
+    for (const g of GITLAB_DEPRECATED_GLOBALLY_DEFINED_KEYWORDS) {
+        if (gitlabData[g] !== undefined) {
+            gitlabData.default[g] = gitlabData[g];
+            delete gitlabData[g]; // Since this is deprecated, deleting it to prevent us from using it internally
+        }
+    }
+}
+
+export function normalize (gitlabData: any) {
+    normalizeGlobalVariables(gitlabData);
+
     for (const [jobName, jobData] of Object.entries<any>(gitlabData)) {
-        if (Job.illegalJobNames.has(jobName)) continue;
-        if (typeof jobData === "string") continue;
+        if (Job.illegalJobNames.has(jobName) || jobName.startsWith(".")) continue;
         needsEach(jobName, gitlabData);
         cacheEach(jobName, gitlabData);
         servicesEach(jobName, gitlabData);
         imageEach(jobName, gitlabData);
-        if (jobData.script) jobData.script = typeof jobData.script === "string" ? [jobData.script] : jobData.script;
+
+        jobData.after_script = (typeof jobData.after_script === "string" && jobData.after_script !== "") ? [jobData.after_script] : jobData.after_script;
+        jobData.before_script = (typeof jobData.before_script === "string" && jobData.before_script !== "") ? [jobData.before_script] : jobData.before_script;
+        jobData.script = (typeof jobData.script === "string" && jobData.script !== "") ? [jobData.script] : jobData.script;
     }
 }
 
@@ -93,6 +123,7 @@ export function needsComplex (data: any) {
         ...(data.project ? {project: data.project} : {}),
         ...(data.ref ? {ref: data.ref} : {}),
         ...(data.optional ? {optional: data.optional} : {}),
+        ...(data.parallel ? {parallel: data.parallel} : {}),
     };
 
     // In needs:project/needs:pipeline, `optional` is not an allowed property
@@ -105,18 +136,17 @@ export function needsComplex (data: any) {
 export function needsEach (jobName: string, gitlabData: any) {
     const jobData = gitlabData[jobName];
     if (!jobData.needs) return;
+    assert(Array.isArray(jobData.needs), chalk`{blueBright ${jobName}} {yellow needs:} must be an array`);
 
-    reference(gitlabData, jobData.needs);
-    jobData.needs = jobData.needs.flat(5);
     for (const [i, n] of Object.entries<any>(jobData.needs)) {
+        assert(n != null, chalk`{blueBright ${jobName}} {yellow needs:} entries cannot be empty`);
         jobData.needs[i] = needsComplex(n);
     }
 }
 
 export function cacheComplex (data: any) {
     return {
-        key: data.key,
-        paths: data.paths,
+        ...data,
         policy: data.policy ?? "pull-push",
         when: data.when ?? "on_success",
     };
@@ -128,10 +158,8 @@ export function cacheEach (jobName: string, gitlabData: any) {
     if (!cache) return;
 
     jobData.cache = Array.isArray(cache) ? cache : [cache];
-    reference(gitlabData, jobData.cache);
-    jobData.cache = jobData.cache.flat(5);
     for (const [i, c] of Object.entries<any>(jobData.cache)) {
-        if (c.key?.files instanceof Array) {
+        if (Array.isArray(c.key?.files)) {
             assert(c.key.files.length === 1 || c.key.files.length === 2, `cache:key:files should be an array of one or two file paths. Got ${c.key.files.length}`);
         }
         jobData.cache[i] = cacheComplex(c);
@@ -157,8 +185,6 @@ export function servicesEach (jobName: string, gitlabData: any) {
     if (!services) return;
 
     jobData.services = Array.isArray(services) ? services : [services];
-    reference(gitlabData, jobData.services);
-    jobData.services = jobData.services.flat(5);
 
     for (const [i, s] of Object.entries<any>(jobData.services)) {
         jobData.services[i] = servicesComplex(s);
@@ -170,7 +196,7 @@ export function imageComplex (data: any) {
     return {
         name: typeof data === "string" ? data : data.name,
         entrypoint: data.entrypoint,
-        ...(data.docker?.user ? {docker: {user: data.docker?.user}} : {}),
+        ...(data.docker?.user || data.docker?.platform ? {docker: {user: data.docker.user, platform: data.docker.platform}} : {}),
     };
 }
 
@@ -179,62 +205,48 @@ export function imageEach (jobName: string, gitlabData: any) {
     const image = jobData.image;
     if (!image) return;
 
-    reference(gitlabData, jobData);
     jobData.image = imageComplex(jobData.image);
 }
 
-export function defaults (gitlabData: any) {
-    const cacheData = gitlabData.default?.cache ?? gitlabData.cache;
-    let cache = null;
-    if (cacheData) {
-        cache = [];
-        for (const c of Array.isArray(cacheData) ? cacheData : [cacheData]) {
-            cache.push(cacheComplex(c));
-        }
-    }
-
-    const serviceData = gitlabData.default?.services ?? gitlabData.services;
-    let services = null;
-    if (serviceData) {
-        services = [];
-        for (const s of serviceData) {
-            services.push(servicesComplex(s));
-        }
-    }
-
-    const image = imageComplex(gitlabData.default?.image ?? gitlabData.image);
-    const artifacts = gitlabData.default?.artifacts ?? gitlabData.artifacts;
-    const beforeScript = gitlabData.default?.before_script ?? gitlabData.before_script;
-    const afterScript = gitlabData.default?.after_script ?? gitlabData.after_script;
-
+export function inheritDefault (gitlabData: any) {
     for (const [jobName, jobData] of Object.entries<any>(gitlabData)) {
-        if (Job.illegalJobNames.has(jobName)) continue;
-        if (typeof jobData === "string") continue;
-        if (!jobData.artifacts && artifacts) jobData.artifacts = artifacts;
-        if (!jobData.cache && cache) jobData.cache = cache;
-        if (!jobData.services && services) jobData.services = services;
-        if (!jobData.image && image) jobData.image = image;
-        if (!jobData.after_script && afterScript) jobData.after_script = afterScript;
-        if (!jobData.before_script && beforeScript) jobData.before_script = beforeScript;
+        if (jobData.inherit?.default === false) continue;
+
+        if (Job.illegalJobNames.has(jobName) || jobName.startsWith(".")) {
+            // skip hidden jobs as they might just contain shared yaml
+            // see https://github.com/firecow/gitlab-ci-local/issues/1277
+            continue;
+        }
+
+        const keywordsToInheritFrom = (Array.isArray(jobData.inherit?.default)) ?
+            jobData.inherit.default :
+            ["artifacts", "cache", "services", "image", "before_script", "after_script"];
+
+        for (const keyword of keywordsToInheritFrom) {
+            if (gitlabData.default[keyword] !== undefined) jobData[keyword] = jobData[keyword] ?? gitlabData.default[keyword];
+        }
     }
 }
 
-export function globalVariables (gitlabData: any) {
+function normalizeGlobalVariables (gitlabData: any) {
     for (const [key, value] of Object.entries<any>(gitlabData.variables ?? {})) {
-        if (value === null) {
-            gitlabData.variables[key] = ""; // variable's values are nullable
-        } else if (Utils.isObject(value)) {
-            gitlabData.variables[key] = String(value["value"]);
-        } else {
-            gitlabData.variables[key] = String(value);
-        }
+        gitlabData.variables[key] = Utils.normalizeVariables(value);
     }
 }
 
 export function flattenLists (gitlabData: any) {
-    traverse(gitlabData, ({parent, key, value}) => {
-        if (parent != null && key != null && Array.isArray(value)) {
-            parent[key] = value.flat(5);
+    const visited = new Set<any>();
+    const flatten = (node: any, nodePath: string) => {
+        if (node == null || typeof node !== "object" || visited.has(node)) return;
+        visited.add(node);
+        for (const [key, value] of Object.entries(node)) {
+            const keyPath = nodePath ? `${nodePath}.${key}` : key;
+            if (Array.isArray(value)) {
+                assert(!value.flat(9).some(Array.isArray), chalk`This Gitlab CI configuration is invalid: {blueBright ${keyPath}} config should be string or a nested array of strings up to 10 level deep`);
+                node[key] = value.flat(9);
+            }
+            flatten(node[key], keyPath);
         }
-    }, {cycleHandling: false});
+    };
+    flatten(gitlabData, "");
 }

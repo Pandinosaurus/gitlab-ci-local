@@ -1,5 +1,6 @@
-import {Utils} from "./utils";
-import {Job} from "./job";
+import {Utils} from "./utils.js";
+import {Job} from "./job.js";
+import {findMatchingNeed, matrixSelectorMatches} from "./parallel.js";
 
 export class Producers {
 
@@ -8,12 +9,10 @@ export class Producers {
 
         if (job.needs && job.needs.length === 0) return [];
         if (!job.needs && !job.dependencies) {
-            for (const jobName of Utils.getJobNamesFromPreviousStages(jobs, stages, job)) {
-                producerSet.add(jobName);
-            }
+            Utils.getJobNamesFromPreviousStages(jobs, stages, job).forEach(jobName => producerSet.add(jobName));
         }
         (job.dependencies ?? []).forEach(dependency => {
-            const foundInNeeds = (job.needs ?? []).find(n => n.job === dependency);
+            const foundInNeeds = (job.needs ?? []).some(n => n.job === dependency);
             if (foundInNeeds) return;
             producerSet.add(dependency);
         });
@@ -30,6 +29,10 @@ export class Producers {
             if (potential.artifacts == null) continue;
             if (potential.when == "never") continue;
             if (!producerSet.has(potential.name) && !producerSet.has(potential.baseName)) continue;
+
+            const matchedNeed = findMatchingNeed(job.needs, potential.name, potential.baseName);
+            if (matchedNeed?.parallel?.matrix && !matrixSelectorMatches(potential.matrixVariables, matchedNeed.parallel.matrix)) continue;
+
             producers.push(potential);
         }
         return producers.map(producer => {

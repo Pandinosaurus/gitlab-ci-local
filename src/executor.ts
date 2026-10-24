@@ -1,21 +1,26 @@
-import chalk from "chalk";
-import {Job} from "./job";
-import assert, {AssertionError} from "assert";
-import {Argv} from "./argv";
-import pMap from "p-map";
+import chalk from "chalk-template";
+import {Job} from "./job.js";
+import assert from "node:assert";
+import {Argv} from "./argv.js";
+import {matrixSelectorMatches} from "./parallel.js";
 
 export class Executor {
 
-    static async runLoop (argv: Argv, jobs: ReadonlyArray<Job>, stages: readonly string[], potentialStarters: Job[]) {
-        let startCandidates = [];
+    static async runLoop (argv: Argv, jobs: ReadonlyArray<Job>, stages: readonly string[], potentialStarters: Job[]): Promise<void> {
+        const queue = Executor.getStartCandidates(jobs, stages, potentialStarters, argv.manual);
+        if (queue.length === 0) return;
 
-        do {
-            startCandidates = Executor.getStartCandidates(jobs, stages, potentialStarters, argv.manual);
-            if (startCandidates.length > 0) {
-                const mapper = async (startCandidate: Job) => startCandidate.start();
-                await pMap(startCandidates, mapper, {concurrency: argv.concurrency ?? startCandidates.length});
-            }
-        } while (startCandidates.length > 0);
+        const startNext = async (): Promise<void> => {
+            const job = queue.shift();
+            if (!job) return;
+            await job.start().catch((e) => {
+                queue.length = 0;
+                throw e;
+            });
+            return startNext();
+        };
+        await Promise.all(Array.from({length: argv.concurrency ?? queue.length}, startNext));
+        return Executor.runLoop(argv, jobs, stages, potentialStarters);
     }
 
     static getStartCandidates (jobs: ReadonlyArray<Job>, stages: readonly string[], potentialStarters: readonly Job[], manuals: string[]) {
@@ -87,17 +92,19 @@ export class Executor {
         const toWaitFor = [];
         assert(job.needs != null, chalk`${job.name}.needs cannot be null in getNeededToWaitFor`);
         for (const need of job.needs) {
-            const baseJobs = jobs.filter(j => j.baseName === need.job);
+            let baseJobs = jobs.filter(j => j.baseName === need.job);
+            if (need.parallel?.matrix && baseJobs.length > 0) {
+                assert(!baseJobs.every(j => j.matrixVariables == null), chalk`{blueBright ${job.name}} uses needs.parallel.matrix targeting {blueBright ${need.job}}, but {blueBright ${need.job}} has no parallel:matrix configuration`);
+                baseJobs = baseJobs.filter(j => matrixSelectorMatches(j.matrixVariables, need.parallel!.matrix));
+                assert(baseJobs.length > 0 || need.optional, chalk`{blueBright ${job.name}} needs.parallel.matrix selector for {blueBright ${need.job}} matched zero permutations`);
+            }
             for (const j of baseJobs) {
-                if (j.when === "never" && !need.optional) {
-                    throw new AssertionError({message: chalk`{blueBright ${j.name}} is when:never, but its needed by {blueBright ${job.name}}`});
-                }
                 if (j.when === "never" && need.optional) {
                     continue;
                 }
-                if (j.when === "manual" && !manuals.includes(j.name)) {
-                    throw new AssertionError({message: chalk`{blueBright ${j.name}} is when:manual, its needed by {blueBright ${job.name}}, and not specified in --manual`});
-                }
+                assert(j.when !== "never", chalk`{blueBright ${j.name}} is when:never, but its needed by {blueBright ${job.name}}`);
+                assert(j.when !== "manual" || manuals.includes(j.name), chalk`{blueBright ${j.name}} is when:manual, its needed by {blueBright ${job.name}}, and not specified in --manual`);
+                assert(job.name !== j.name, chalk`This GitLab CI configuration is invalid: The pipeline has circular dependencies: self-dependency: {blueBright ${need.job}}.`);
                 toWaitFor.push(j);
             }
         }

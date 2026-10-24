@@ -1,0 +1,40 @@
+import {WriteStreamsMock} from "../../../src/write-streams.js";
+import {handler} from "../../../src/handler.js";
+import chalk from "chalk-template";
+import {initSpawnSpy} from "../../mocks/utils.mock.js";
+import {WhenStatics} from "../../mocks/when-statics.js";
+
+beforeAll(() => {
+    initSpawnSpy(WhenStatics.all);
+});
+
+test.concurrent("artifacts-globstar <test-job> --needs --shell-isolation", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/artifacts-globstar",
+        job: ["test-job"],
+        needs: true,
+        shellIsolation: true,
+        stateDir: ".gitlab-ci-local-artifacts-globstar-test-job-needs-shell-isolation",
+    }, writeStreams);
+
+    const expected = [
+        chalk`{blueBright test-job} {greenBright >} Pre something`,
+    ];
+    expect(writeStreams.stdoutLines).toEqual(expect.arrayContaining(expected));
+});
+
+test.concurrent("artifacts-globstar <no-match> --shell-isolation", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/artifacts-globstar",
+        job: ["no-match"],
+        shellIsolation: true,
+        stateDir: ".gitlab-ci-local-artifacts-globstar-no-match-shell-isolation",
+    }, writeStreams);
+
+    const expected = [
+        chalk`{blueBright no-match} {yellow !! no artifacts was copied !!}`,
+    ];
+    expect(writeStreams.stdoutLines).toEqual(expect.arrayContaining(expected));
+});

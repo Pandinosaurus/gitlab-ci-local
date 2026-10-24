@@ -1,15 +1,18 @@
-import {Utils} from "./utils";
+import {Argv} from "./argv.js";
+import {Utils} from "./utils.js";
 import fs from "fs-extra";
-import {WriteStreams} from "./write-streams";
-import {GitData} from "./git-data";
-import assert, {AssertionError} from "assert";
-import chalk from "chalk";
-import {Parser} from "./parser";
-import axios from "axios";
-import globby from "globby";
-import path from "path";
+import {WriteStreams} from "./write-streams.js";
+import {GitData} from "./git-data.js";
+import assert, {AssertionError} from "node:assert";
+import chalk from "chalk-template";
+import {Parser} from "./parser.js";
+import path from "node:path";
+import semver from "semver";
+import {RE2JS} from "re2js";
+import {globbySync} from "globby";
 
 type ParserIncludesInitOptions = {
+    argv: Argv;
     cwd: string;
     stateDir: string;
     writeStreams: WriteStreams;
@@ -17,121 +20,188 @@ type ParserIncludesInitOptions = {
     fetchIncludes: boolean;
     variables: {[key: string]: string};
     expandVariables: boolean;
+    maximumIncludes: number;
+    inputs: {[key: string]: any};
 };
 
-const MAXIMUM_INCLUDE = 150; // https://docs.gitlab.com/ee/administration/settings/continuous_integration.html#maximum-includes
+type ParsedComponent = {
+    _cache: {
+        version: string | null | undefined;
+        effectiveRef: string | undefined;
+        sha: string | undefined;
+    };
+    gitData: GitData;
+    domain: string;
+    port: string;
+    projectPath: string;
+    componentPath: string;
+    name: string;
+    reference: string;
+    version: string | null;
+    effectiveRef: string;
+    sha: string;
+    isLocal: boolean;
+};
+
+type GitRemoteInfoContext = {
+    gitData: GitData;
+    domain: string;
+    port: string;
+    projectPath: string;
+};
 
 export class ParserIncludes {
     private static count: number = 0;
+    private static gitRemoteInfoCache: Record<string, string> = {};
 
     static resetCount (): void {
         this.count = 0;
+        this.gitRemoteInfoCache = {};
+    }
+
+    private static normalizeTriggerInclude (gitlabData: any, opts: ParserIncludesInitOptions) {
+        const {writeStreams} = opts;
+        for (const [jobName, jobData] of Object.entries<any>(gitlabData ?? {})) {
+            if (typeof jobData.trigger?.include === "string") {
+                jobData.trigger.include = [{
+                    local: jobData.trigger.include,
+                } ];
+            } else if (jobData.trigger?.project) {
+                writeStreams.memoStdout(chalk`{bgYellowBright  WARN } The job: \`{blueBright ${jobName}}\` will be no-op. Multi-project pipeline is not supported by gitlab-ci-local\n`);
+            }
+        }
     }
 
     static async init (gitlabData: any, opts: ParserIncludesInitOptions): Promise<any[]> {
+        const {argv, inputs: inputsConfig} = opts;
+        const fileInputs = inputsConfig._file ?? {};
+        const cliGlobalInputs = inputsConfig._cliGlobal ?? {};
+        const cliComponentInputs = inputsConfig._cliComponents ?? {};
+
+        const isStructured = Utils.isStructuredInputsFile(fileInputs);
+        const globalInputs = {...Utils.getGlobalFileInputs(fileInputs), ...cliGlobalInputs};
         this.count++;
         assert(
-            this.count <= MAXIMUM_INCLUDE + 1, // 1st init call is not counted
-            chalk`This GitLab CI configuration is invalid: Maximum of {blueBright ${MAXIMUM_INCLUDE}} nested includes are allowed!.`
+            this.count <= opts.maximumIncludes + 1, // 1st init call is not counted
+            chalk`This GitLab CI configuration is invalid: Maximum of {blueBright ${opts.maximumIncludes}} nested includes are allowed!. This limit can be increased with the --maximum-includes cli flags.`,
         );
         let includeDatas: any[] = [];
         const promises = [];
-        const {stateDir, cwd, fetchIncludes, gitData, expandVariables} = opts;
+        const {stateDir, cwd, fetchIncludes, gitData, expandVariables, writeStreams} = opts;
+        // cache the parsed component, because parseIncludeComponent is expensive and we would call it twice otherwise
+        const componentParseCache = new Map<number, ParsedComponent>();
 
         const include = this.expandInclude(gitlabData?.include, opts.variables);
 
+        this.normalizeTriggerInclude(gitlabData, opts);
         // Find files to fetch from remote and place in .gitlab-ci-local/includes
-        for (const value of include) {
+        for (const [index, value] of include.entries()) {
             if (value["rules"]) {
                 const include_rules = value["rules"];
-                const rulesResult = Utils.getRulesResult({cwd, rules: include_rules, variables: opts.variables}, gitData);
+                const rulesResult = Utils.getRulesResult({argv, cwd, rules: include_rules, variables: opts.variables}, gitData);
+                if (rulesResult.when === "never") {
+                    continue;
+                }
+            }
+            if (value["file"]) {
+                for (const fileValue of Array.isArray(value["file"]) ? value["file"] : [value["file"]]) {
+                    promises.push(this.downloadIncludeProjectFile(opts, value["project"], value["ref"] || "HEAD", fileValue));
+                }
+            } else if (value["template"]) {
+                const {project, ref, file, domain} = this.covertTemplateToProjectFile(value["template"]);
+                const url = `https://${domain}/${project}/-/raw/${ref}/${file}`;
+                promises.push(this.downloadIncludeRemote(cwd, stateDir, url, fetchIncludes, writeStreams));
+            } else if (value["remote"]) {
+                promises.push(this.downloadIncludeRemote(cwd, stateDir, value["remote"], fetchIncludes, writeStreams));
+            } else if (value["component"]) {
+                const component = this.parseIncludeComponent(value["component"], gitData);
+                promises.push((async () => {
+                    if (!component.isLocal) {
+                        await this.downloadIncludeComponent(opts, component.projectPath, component.effectiveRef, component.componentPath);
+                    }
+                    componentParseCache.set(index, component);
+                })());
+            }
+        }
+
+        await Promise.all(promises);
+
+        for (const [index, value] of include.entries()) {
+            if (value["rules"]) {
+                const include_rules = value["rules"];
+                const rulesResult = Utils.getRulesResult({argv, cwd, rules: include_rules, variables: opts.variables}, gitData);
                 if (rulesResult.when === "never") {
                     continue;
                 }
             }
             if (value["local"]) {
                 validateIncludeLocal(value["local"]);
-                const files = await globby(value["local"].replace(/^\//, ""), {dot: true, cwd});
+                const files = await resolveIncludeLocal(value["local"], cwd);
                 if (files.length == 0) {
                     throw new AssertionError({message: `Local include file cannot be found ${value["local"]}`});
                 }
-            } else if (value["file"]) {
-                for (const fileValue of Array.isArray(value["file"]) ? value["file"] : [value["file"]]) {
-                    promises.push(this.downloadIncludeProjectFile(cwd, stateDir, value["project"], value["ref"] || "HEAD", fileValue, gitData, fetchIncludes));
-                }
-            } else if (value["template"]) {
-                const {project, ref, file, domain} = this.covertTemplateToProjectFile(value["template"]);
-                const url = `https://${domain}/${project}/-/raw/${ref}/${file}`;
-                promises.push(this.downloadIncludeRemote(cwd, stateDir, url, fetchIncludes));
-            } else if (value["remote"]) {
-                promises.push(this.downloadIncludeRemote(cwd, stateDir, value["remote"], fetchIncludes));
-            }
-
-        }
-
-        await Promise.all(promises);
-
-        for (const value of include) {
-            if (value["rules"]) {
-                const include_rules = value["rules"];
-                const rulesResult = Utils.getRulesResult({cwd, rules: include_rules, variables: opts.variables}, gitData);
-                if (rulesResult.when === "never") {
-                    continue;
-                }
-            }
-            if (value["local"]) {
-                const files = await globby([value["local"].replace(/^\//, "")], {dot: true, cwd});
                 for (const localFile of files) {
-                    const content = await Parser.loadYaml(`${cwd}/${localFile}`, {inputs: value.inputs || {}}, expandVariables);
+                    const mergedInputs = {...value.inputs, ...globalInputs};
+                    const content = await Parser.loadYaml(localFile, {inputs: mergedInputs, skipInputValidation: argv.skipInputValidation}, expandVariables, writeStreams);
                     includeDatas = includeDatas.concat(await this.init(content, opts));
                 }
             } else if (value["project"]) {
                 for (const fileValue of Array.isArray(value["file"]) ? value["file"] : [value["file"]]) {
-                    const fileDoc = await Parser.loadYaml(
-                        `${cwd}/${stateDir}/includes/${gitData.remote.host}/${value["project"]}/${value["ref"] || "HEAD"}/${fileValue}`
-                        , {inputs: value.inputs || {}}
-                        , expandVariables);
-                    // Expand local includes inside a "project"-like include
-                    fileDoc["include"] = this.expandInclude(fileDoc["include"], opts.variables);
-                    fileDoc["include"].forEach((inner: any, i: number) => {
-                        if (!inner["local"]) return;
-                        fileDoc["include"][i] = {
-                            project: value["project"],
-                            file: inner["local"].replace(/^\//, ""),
-                            ref: value["ref"],
-                        };
-                    });
-
-                    includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
+                    const mergedInputs = {...value.inputs, ...globalInputs};
+                    const includeDir = `${cwd}/${stateDir}/includes/${gitData.remote.host}/${value["project"]}/${value["ref"] || "HEAD"}`;
+                    const normalizedFile = fileValue.replace(/^\/+/, "");
+                    const matches = globbySync(normalizedFile, {cwd: includeDir, absolute: true}).sort((a, b) => Number(a > b) - Number(a < b));
+                    const filePaths = matches.length > 0 ? matches : [`${includeDir}/${normalizedFile}`];
+                    for (const filePath of filePaths) {
+                        const fileDoc = await Parser.loadYaml(filePath, {inputs: mergedInputs, skipInputValidation: argv.skipInputValidation}, expandVariables, writeStreams);
+                        // Expand local includes inside a "project"-like include
+                        fileDoc["include"] = this.expandInnerLocalIncludes(fileDoc["include"], value["project"], value["ref"], opts);
+                        includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
+                    }
                 }
             } else if (value["component"]) {
-                const {domain, projectPath, componentName, ref} = this.parseIncludeComponent(value["component"]);
-                // converts component to project
-                const files = [`${componentName}.yml`, `${componentName}/template.yml`, null];
+                const component = componentParseCache.get(index);
+                assert(component !== undefined, `Internal error, component parse cache missing entry [${index}]`);
+                // Gitlab allows two different file paths to include a component
+                const files = [`${component.componentPath}.yml`, `${component.componentPath}/template.yml`];
+
+                let file = null;
                 for (const f of files) {
-                    assert(f !== null, `This GitLab CI configuration is invalid: component: \`${value["component"]}\`. One of the file [${files}] must exists in \`${domain}/${projectPath}\``);
-                    if (!(await Utils.remoteFileExist(f, ref, domain, projectPath, gitData.remote.schema))) continue;
-                    const fileDoc = {
-                        include: {
-                            project: projectPath,
-                            file: f,
-                            ref: ref,
-                        },
-                    };
-                    includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
-                    break;
+                    let searchPath = `${cwd}/${f}`;
+                    if (!component.isLocal) {
+                        searchPath = `${cwd}/${stateDir}/includes/${gitData.remote.host}/${component.projectPath}/${component.effectiveRef}/${f}`;
+                    }
+                    if (fs.existsSync(searchPath)) {
+                        file = searchPath;
+                    }
                 }
+                assert(file !== null, `This GitLab CI configuration is invalid: component: \`${value["component"]}\`. One of the files [${files}] must exist in \`${component.domain}` +
+                                    (component.port ? `:${component.port}` : "") + `/${component.projectPath}\``);
+
+                // Extract component name for component-specific inputs
+                const componentName = component.componentPath.replace(/^templates\//, "");
+                const fileComponentInputs = isStructured ? (fileInputs[componentName] ?? {}) : {};
+                const cliComponentSpecificInputs = cliComponentInputs[componentName] ?? {};
+                const mergedInputs = {...value.inputs, ...globalInputs, ...fileComponentInputs, ...cliComponentSpecificInputs};
+                const fileDoc = await Parser.loadYaml(file, {inputs: mergedInputs, component, skipInputValidation: argv.skipInputValidation}, expandVariables, writeStreams);
+                if (!component.isLocal) {
+                    // Expand local includes inside to a "project"-like include
+                    fileDoc["include"] = this.expandInnerLocalIncludes(fileDoc["include"], component.projectPath, component.effectiveRef, opts);
+                }
+                includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
             } else if (value["template"]) {
                 const {project, ref, file, domain} = this.covertTemplateToProjectFile(value["template"]);
                 const fsUrl = Utils.fsUrl(`https://${domain}/${project}/-/raw/${ref}/${file}`);
+                const mergedInputs = {...value.inputs, ...globalInputs};
                 const fileDoc = await Parser.loadYaml(
-                    `${cwd}/${stateDir}/includes/${fsUrl}`, {inputs: value.inputs || {}}, expandVariables
+                    `${cwd}/${stateDir}/includes/${fsUrl}`, {inputs: mergedInputs, skipInputValidation: argv.skipInputValidation}, expandVariables, writeStreams,
                 );
                 includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
             } else if (value["remote"]) {
                 const fsUrl = Utils.fsUrl(value["remote"]);
+                const mergedInputs = {...value.inputs, ...globalInputs};
                 const fileDoc = await Parser.loadYaml(
-                    `${cwd}/${stateDir}/includes/${fsUrl}`, {inputs: value.inputs || {}}, expandVariables
+                    `${cwd}/${stateDir}/includes/${fsUrl}`, {inputs: mergedInputs, skipInputValidation: argv.skipInputValidation}, expandVariables, writeStreams,
                 );
                 includeDatas = includeDatas.concat(await this.init(fileDoc, opts));
             } else {
@@ -165,7 +235,11 @@ export class ParserIncludes {
 
         for (const entry of include) {
             for (const [key, value] of Object.entries(entry)) {
-                entry[key] = Utils.expandText(value, variables);
+                if (Array.isArray(value)) {
+                    entry[key] = value.map((v) => Utils.expandText(v, variables));
+                } else {
+                    entry[key] = Utils.expandText(value, variables);
+                }
             }
         }
 
@@ -181,66 +255,285 @@ export class ParserIncludes {
         };
     }
 
-    static parseIncludeComponent (component: string): {domain: string; projectPath: string; componentName: string; ref: string} {
-        assert(!component.includes("://"), `This GitLab CI configuration is invalid: component: \`${component}\` should not contain protocol`);
-        // eslint-disable-next-line no-useless-escape
-        const pattern = /(?<domain>[^/\s]+)\/(?<projectPath>.+)\/(?<componentName>[^@]+)@(?<ref>.+)/; // regexr.com/7v7hm
-        const gitRemoteMatch = pattern.exec(component);
+    static getGitRemoteInfo (ctx: GitRemoteInfoContext, ...args: string[]): string {
+        const cmdArgs = ["git", "ls-remote", ...args];
+        if (ctx.gitData.remote.schema == "git" || ctx.gitData.remote.schema == "ssh") {
+            cmdArgs.push(`git@${ctx.domain}:${ctx.projectPath}`);
+        } else {
+            cmdArgs.push(`${ctx.gitData.remote.schema}://${ctx.domain}:${ctx.port ?? 443}/${ctx.projectPath}.git`);
+        }
+        const cmdStr = cmdArgs.join(" ");
+        if (!(cmdStr in this.gitRemoteInfoCache)) {
+            this.gitRemoteInfoCache[cmdStr] = Utils.syncSpawn(cmdArgs).stdout;
+        }
+        return this.gitRemoteInfoCache[cmdStr];
+    };
 
+    static parseIncludeComponent (component: string, gitData: GitData): ParsedComponent {
+        assert(!component.includes("://"), `This GitLab CI configuration is invalid: component: \`${component}\` should not contain protocol`);
+        const pattern = /(?<domain>[^/:\s]+)(:(?<port>\d+))?\/(?<projectPath>.+)\/(?<componentName>[^@]+)@(?<ref>.+)/; // https://regexr.com/7v7hm
+        const gitRemoteMatch = pattern.exec(component);
         if (gitRemoteMatch?.groups == null) throw new Error(`This is a bug, please create a github issue if this is something you're expecting to work. input: ${component}`);
+        const {domain, projectPath, port, componentName, ref} = gitRemoteMatch.groups;
+        const isLocalComponent = projectPath === `${gitData.remote.group}/${gitData.remote.project}` && ref === gitData.commit.SHA;
         return {
-            domain: gitRemoteMatch.groups["domain"],
-            projectPath: gitRemoteMatch.groups["projectPath"],
-            componentName: `templates/${gitRemoteMatch.groups["componentName"]}`,
-            ref: gitRemoteMatch.groups["ref"],
+            _cache: {
+                version: undefined,
+                effectiveRef: undefined,
+                sha: undefined,
+            },
+            gitData,
+            domain,
+            port,
+            projectPath,
+            componentPath: `templates/${componentName}`,
+            name: componentName,
+            reference: ref,
+            get version () {
+                if (this._cache.version === undefined) {
+                    if (this.isLocal) {
+                        this._cache.version = this.gitData.commit.SHA;
+                    } else {
+                        const semanticVersionRangesPattern = /^\d+(\.\d+)?$/;
+                        if (this.reference == "~latest" || semanticVersionRangesPattern.test(this.reference)) {
+                            // https://docs.gitlab.com/ci/components/#semantic-version-ranges
+                            const stdout = ParserIncludes.getGitRemoteInfo(this, "--tags");
+                            const tags = stdout.split("\n").map(line => line.split("\t")[1].split("/")[2]);
+                            const version = resolveSemanticVersionRange(this.reference, tags);
+                            assert(version ?? tags.includes(this.reference), `This GitLab CI configuration is invalid: component: \`${this.name}\` - The reference (${this.reference}) is invalid`);
+                            this._cache.version = version ?? null;
+                        } else {
+                            this._cache.version = null;
+                        }
+                    }
+                }
+                return this._cache.version;
+            },
+            get effectiveRef () {
+                this._cache.effectiveRef ??= this.version ?? this.reference;
+                return this._cache.effectiveRef;
+            },
+            get sha () {
+                if (this._cache.sha === undefined) {
+                    if (this.isLocal) {
+                        this._cache.sha = this.gitData.commit.SHA;
+                    } else if (/^[0-9a-f]{40}$/i.test(this.effectiveRef)) {
+                        // effectiveRef may already be a sha, if so return it directly
+                        this._cache.sha = this.effectiveRef;
+                    } else {
+                        const stdout = ParserIncludes.getGitRemoteInfo(this);
+                        const lines = stdout.split("\n");
+                        // annotated tags: prefer the deref'd commit sha (refs/tags/x^{})
+                        const match = lines.find(line => line.endsWith(`refs/tags/${this.effectiveRef}^{}`)) ??
+                            lines.find(line =>
+                                line.endsWith(`refs/tags/${this.effectiveRef}`) ||
+                                line.endsWith(`refs/heads/${this.effectiveRef}`),
+                            );
+                        assert(match, `Could not resolve commit SHA for ${this.effectiveRef} in ${this.projectPath}`);
+                        this._cache.sha = match.split("\t")[0];
+                    }
+                }
+                return this._cache.sha;
+            },
+            isLocal: isLocalComponent,
         };
     }
 
-    static async downloadIncludeRemote (cwd: string, stateDir: string, url: string, fetchIncludes: boolean): Promise<void> {
+    // Expand local includes inside to a "project"-like include
+    static expandInnerLocalIncludes (fileIncludes: any, projectPath: string, ref: string, opts: ParserIncludesInitOptions) {
+        const {argv} = opts;
+        const updatedIncludes = this.expandInclude(fileIncludes, opts.variables);
+        updatedIncludes.forEach((inner: any, i: number) => {
+            if (!inner["local"]) return;
+            if (inner["rules"]) {
+                const rulesResult = Utils.getRulesResult({argv, cwd: opts.cwd, variables: opts.variables, rules: inner["rules"]}, opts.gitData);
+                if (rulesResult.when === "never") {
+                    return;
+                }
+            }
+            updatedIncludes[i] = {
+                project: projectPath,
+                file: inner["local"].replace(/^\//, ""),
+                ref: ref,
+                inputs: inner.inputs || {},
+            };
+        });
+        return updatedIncludes;
+    }
+
+    static async downloadIncludeRemote (cwd: string, stateDir: string, url: string, fetchIncludes: boolean, writeStreams: WriteStreams): Promise<void> {
         const fsUrl = Utils.fsUrl(url);
         try {
             const target = `${cwd}/${stateDir}/includes/${fsUrl}`;
             if (await fs.pathExists(target) && !fetchIncludes) return;
-            const res = await axios.get(url);
-            await fs.outputFile(target, res.data);
+            const time = process.hrtime();
+            const res = await fetch(url, {headers: {"User-Agent": "gitlab-ci-local"}});
+            if (!res.ok) throw new Error(`Request failed with status code ${res.status}`);
+            await fs.outputFile(target, await res.text());
+            writeStreams.stderr(chalk`{grey downloaded ${url} in ${Utils.prettyHrtime(process.hrtime(time))}}\n`);
         } catch (e) {
             throw new AssertionError({message: `Remote include could not be fetched ${url}\n${e}`});
         }
     }
 
-    static async downloadIncludeProjectFile (cwd: string, stateDir: string, project: string, ref: string, file: string, gitData: GitData, fetchIncludes: boolean): Promise<void> {
+    private static async gitCloneSparseCheckout (cwd: string, stateDir: string, tmpDir: string, remote: GitData["remote"], project: string, ref: string, sparsePaths: string[]): Promise<void> {
+        await fs.mkdirp(`${cwd}/${stateDir}`);
+        const isCommitSha = /^[0-9a-f]{40}$/i.test(ref);
+        const gitCloneBranch = (ref === "HEAD" || isCommitSha) ? "" : `--branch ${Utils.safeBashString(ref)}`;
+        await Utils.bashMulti([
+            `cd ${Utils.safeBashString(cwd)}/${Utils.safeBashString(stateDir)}`,
+            `git clone ${gitCloneBranch} -n --depth=1 --filter=tree:0 ${Utils.safeBashString(remoteProjectUrl(remote, project))} ${Utils.safeBashString(tmpDir)}`,
+            `cd ${Utils.safeBashString(tmpDir)}`,
+            ...isCommitSha ? [`git fetch --depth=1 --filter=tree:0 origin ${Utils.safeBashString(ref)}`] : [],
+            `git sparse-checkout set --no-cone ${sparsePaths.map((p) => Utils.safeBashString(p)).join(" ")}`,
+            isCommitSha ? "git checkout FETCH_HEAD" : "git checkout",
+        ], cwd);
+    }
+
+    private static safeArchiveUrl (remote: GitData["remote"], project: string): string {
+        return Utils.safeBashString(`ssh://git@${remote.host}:${remote.port}/${project}.git`);
+    }
+
+    static async downloadIncludeProjectFile (opts: ParserIncludesInitOptions, project: string, ref: string, file: string): Promise<void> {
+        const {cwd, stateDir, gitData, fetchIncludes, writeStreams} = opts;
         const remote = gitData.remote;
         const normalizedFile = file.replace(/^\/+/, "");
+        let tmpDir = null;
         try {
             const target = `${stateDir}/includes/${remote.host}/${project}/${ref}`;
             if (await fs.pathExists(`${cwd}/${target}/${normalizedFile}`) && !fetchIncludes) return;
+            const time = process.hrtime();
 
             if (remote.schema.startsWith("http")) {
                 const ext = "tmp-" + Math.random();
-                await fs.mkdirp(path.dirname(`${cwd}/${target}/${normalizedFile}`));
-                await Utils.bash(`
-                    cd ${cwd}/${stateDir} \\
-                        && git clone --branch "${ref}" -n --depth=1 --filter=tree:0 \\
-                                ${remote.schema}://${remote.host}/${project}.git \\
-                                ${cwd}/${target}.${ext} \\
-                        && cd ${cwd}/${target}.${ext} \\
-                        && git sparse-checkout set --no-cone ${normalizedFile} \\
-                        && git checkout \\
-                        && cd ${cwd}/${stateDir} \\
-                        && cp ${cwd}/${target}.${ext}/${normalizedFile} \\
-                              ${cwd}/${target}/${normalizedFile}
-                    `, cwd);
+                tmpDir = `${cwd}/${target}.${ext}`;
+
+                await this.gitCloneSparseCheckout(cwd, stateDir, tmpDir, remote, project, ref, [normalizedFile]);
+
+                const matches = globbySync(normalizedFile, {cwd: tmpDir, absolute: true});
+                const filesToCopy = matches.length > 0 ? matches : [`${tmpDir}/${normalizedFile}`];
+                for (const matchedFile of filesToCopy) {
+                    const relativePath = path.relative(tmpDir, matchedFile);
+                    assert(!relativePath.startsWith("..") && !path.isAbsolute(relativePath), `Include file path escapes the fetched project: ${normalizedFile}`);
+                    await fs.copy(matchedFile, `${cwd}/${target}/${relativePath}`);
+                }
             } else {
+                const targetDirectory = `${target}/`;
                 await fs.mkdirp(`${cwd}/${target}`);
-                await Utils.bash(`set -eou pipefail; git archive --remote=ssh://git@${remote.host}:${remote.port}/${project}.git ${ref} ${normalizedFile} | tar -f - -xC ${target}/`, cwd);
+                await Utils.bash(`set -eou pipefail; git archive --remote=${this.safeArchiveUrl(remote, project)} -- ${Utils.safeBashString(ref)} ${Utils.safeBashString(normalizedFile)} | tar -f - -xC ${Utils.safeBashString(targetDirectory)}`, cwd);
             }
+            writeStreams.stderr(chalk`{grey downloaded ${project} ${ref} ${normalizedFile} in ${Utils.prettyHrtime(process.hrtime(time))}}\n`);
         } catch (e) {
             throw new AssertionError({message: `Project include could not be fetched { project: ${project}, ref: ${ref}, file: ${normalizedFile} }\n${e}`});
+        } finally {
+            if (tmpDir !== null) {
+                // always cleanup temporary directory (if created)
+                await fs.rm(tmpDir, {recursive: true, force: true});
+            }
         }
     }
+
+    static async downloadIncludeComponent (opts: ParserIncludesInitOptions, project: string, ref: string, componentName: string): Promise<void> {
+        const {cwd, stateDir, gitData, fetchIncludes, writeStreams} = opts;
+        const remote = gitData.remote;
+        const files = [`${componentName}.yml`, `${componentName}/template.yml`];
+        let tmpDir = null;
+        try {
+            const target = `${stateDir}/includes/${remote.host}/${project}/${ref}`;
+
+            if (!fetchIncludes && (await fs.pathExists(`${cwd}/${target}/${files[0]}`) || await fs.pathExists(`${cwd}/${target}/${files[1]}`))) return;
+            const time = process.hrtime();
+
+            if (remote.schema.startsWith("http")) {
+                const ext = "tmp-" + Math.random();
+                await fs.mkdirp(path.dirname(`${cwd}/${target}/templates`));
+                tmpDir = `${cwd}/${target}.${ext}`;
+
+                await this.gitCloneSparseCheckout(cwd, stateDir, tmpDir, remote, project, ref, files);
+
+                // create templates subdir (if it doesn't exist), as the check out may not create it
+                await fs.mkdirp(`${tmpDir}/templates`);
+                await fs.copy(`${tmpDir}/templates`, `${cwd}/${target}/templates`);
+            } else {
+                // git archive fails if the paths do not exist, to work around this we use a wildcard "templates/component*.yml"
+                // this resolves to either "templates/component.yml" or "templates/component/template.yml"
+                // if both exist "templates/component.yml" will be pulled
+                // Drawback: also pulls all other .yml files from templates/component/ directory
+                const componentWildcard = `${componentName}*.yml`;
+                const targetDirectory = `${target}/`;
+                await fs.mkdirp(`${cwd}/${target}`);
+                await Utils.bash(`set -eou pipefail; git archive --remote=${this.safeArchiveUrl(remote, project)} -- ${Utils.safeBashString(ref)} ${Utils.safeBashString(componentWildcard)} | tar -f - -xC ${Utils.safeBashString(targetDirectory)}`, cwd);
+            }
+            writeStreams.stderr(chalk`{grey downloaded ${project} ${ref} ${componentName} in ${Utils.prettyHrtime(process.hrtime(time))}}\n`);
+        } catch (e) {
+            throw new AssertionError({message: `Component include could not be fetched { project: ${project}, ref: ${ref}, file: ${files} }\n${e}`});
+        } finally {
+            if (tmpDir !== null) {
+                // always cleanup temporary directory (if created)
+                await fs.rm(tmpDir, {recursive: true, force: true});
+            }
+        }
+    }
+
+    static readonly memoLocalRepoFiles = (() => {
+        const cache = new Map<string, string[]>();
+        return async (path: string) => {
+            let result = cache.get(path);
+            if (result !== undefined) return result;
+
+            result = (await Utils.getTrackedFiles(path)).map(p => `${path}/${p}`);
+            cache.set(path, result);
+            return result;
+        };
+    })();
 }
 
-function validateIncludeLocal (filePath: string) {
+export function validateIncludeLocal (filePath: string) {
     assert(!filePath.startsWith("./"), `\`${filePath}\` for include:local is invalid. Gitlab does not support relative path (ie. cannot start with \`./\`).`);
     assert(!filePath.includes(".."), `\`${filePath}\` for include:local is invalid. Gitlab does not support directory traversal.`);
+}
+
+export function resolveSemanticVersionRange (range: string, gitTags: string[]) {
+    /** sorted list of tags thats compliant to semantic version where index 0 is the latest */
+    const sanitizedSemverTags = semver.rsort(
+        gitTags.filter(s => semver.valid(s)),
+    );
+
+    const found = sanitizedSemverTags.find(t => {
+        if (range == "~latest") {
+            const semverParsed = semver.parse(t);
+            assert(semverParsed);
+            return (semverParsed.prerelease.length == 0 && semverParsed.build.length == 0);
+        } else {
+            return semver.satisfies(t, range);
+        }
+    });
+    return found;
+}
+
+export async function resolveIncludeLocal (pattern: string, cwd: string) {
+    const repoFiles = await ParserIncludes.memoLocalRepoFiles(cwd);
+
+    if (!pattern.startsWith("/")) pattern = `/${pattern}`; // Ensure pattern starts with `/`
+    pattern = `${cwd}${pattern}`;
+
+    // escape all special regex metacharacters
+    pattern = pattern.replaceAll(/[.*+?^${}()|[\]\\]/g, String.raw`\$&`);
+
+    // `**` matches anything
+    const anything = ".*?";
+    pattern = pattern.replaceAll(String.raw`\*\*`, anything);
+
+    // `*` matches anything except for `/`
+    const anything_but_not_slash = "([^/])*?";
+    pattern = pattern.replaceAll(String.raw`\*`, anything_but_not_slash);
+
+    const re2js = RE2JS.compile(`^${pattern}`);
+    return repoFiles.filter((f: any) => re2js.matches(f));
+}
+
+export function remoteProjectUrl (remote: {schema: string; host: string; port: string}, project: string) {
+    const defaultPort = remote.schema === "http" ? "80" : "443";
+    const port = remote.port === defaultPort ? "" : `:${remote.port}`;
+    return `${remote.schema}://${remote.host}${port}/${project}.git`;
 }

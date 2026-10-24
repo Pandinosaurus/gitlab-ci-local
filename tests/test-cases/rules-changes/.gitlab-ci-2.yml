@@ -1,0 +1,22 @@
+---
+alpine:
+  image: alpine
+  rules:
+    - changes:
+        paths:
+          - "foo"
+  script:
+    - echo "Job is running"
+
+matrix:
+  image: alpine
+  parallel:
+    matrix:
+      - FILE:
+          - foo
+  rules:
+    - changes:
+        paths:
+          - "${FILE}"
+  script:
+    - echo "Job is running"

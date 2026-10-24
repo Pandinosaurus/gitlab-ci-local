@@ -1,0 +1,612 @@
+import {WriteStreamsMock} from "../../../src/write-streams.js";
+import {handler} from "../../../src/handler.js";
+import {Parser} from "../../../src/parser.js";
+import assert, {AssertionError} from "assert";
+import {initSpawnSpy} from "../../mocks/utils.mock.js";
+import {WhenStatics} from "../../mocks/when-statics.js";
+import chalk from "chalk-template";
+
+beforeAll(() => {
+    initSpawnSpy(WhenStatics.all);
+});
+
+test.concurrent("include-inputs basic example", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/basic-example",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo hello website
+    - echo hello website
+    - echo hello website
+scan-db:
+  script:
+    - echo hello db
+    - echo hello db
+    - echo hello db`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs required inputs", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/required-inputs",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`\`{blueBright required_inputs}\` input: required value has not been provided`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs unknown interpolation key (TypeError)", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/unknown-interpolation-key-1",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`unknown interpolation key: \`foo\`.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs unknown interpolation key (AssertionError)", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/unknown-interpolation-key-2",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`unknown interpolation key: \`foo\`.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs defaults", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/default",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo string
+    - echo 1
+    - echo true
+    - echo overwrite default value
+    - alice
+    - bob`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs interpolation key containing hyphen", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/interpolation-key-hyphen",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo baz`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs interpolation repeated", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/interpolation-repeat",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+job foo foo:
+  script:
+    - echo foofoo`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs inputs validation for array", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/type-validation/array",
+            preview: true,
+        }, writeStreams);
+        expect(true).toBe(false);
+    } catch (e) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(chalk`\`{blueBright array_input}\` input: provided value is not a {blueBright array}.`);
+    }
+});
+
+test.concurrent("include-inputs inputs validation for string", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/type-validation/string",
+            preview: true,
+        }, writeStreams);
+        expect(true).toBe(false);
+    } catch (e) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(chalk`\`{blueBright string_input}\` input: provided value is not a {blueBright string}.`);
+    }
+});
+
+test.concurrent("include-inputs inputs validation for number", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/type-validation/number",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(chalk`\`{blueBright number_input}\` input: provided value is not a {blueBright number}.`);
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs can skip type validation for a mismatched default type", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/type-validation/number",
+        preview: true,
+        skipInputValidation: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  variables:
+    NUMBER_INPUT: '1'
+  script:
+    - echo 1`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs can skip validation and preserve a provided value's actual type", async () => {
+    const writeStreams = new WriteStreamsMock();
+    const templatePath =
+        "tests/test-cases/include-inputs/input-templates/type-validation/number/.gitlab-ci-input-template.yml";
+
+    const parsed = await Parser.loadYaml(
+        templatePath,
+        {
+            inputs: {
+                number_input: "1",
+            },
+            skipInputValidation: true,
+        },
+        true,
+        writeStreams,
+    );
+
+    expect(parsed["scan-website"].variables.NUMBER_INPUT).toBe("1");
+    expect(typeof parsed["scan-website"].variables.NUMBER_INPUT).toBe("string");
+});
+
+test.concurrent("include-inputs reports unsupported value types when validation is skipped", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/type-validation/object",
+            preview: true,
+            skipInputValidation: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(chalk`\`{blueBright object_input}\` input: provided value has unsupported type {blueBright object}.`);
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs reports null values when validation is skipped", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/type-validation/null",
+            preview: true,
+            skipInputValidation: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(chalk`\`{blueBright null_input}\` input: provided value has unsupported type {blueBright null}.`);
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs for type array", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/types/array",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+test_job:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+      when: manual
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+  script:
+    - ls`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs for type boolean (truthy)", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/types/boolean",
+        file: ".gitlab-ci-1.yml",
+        preview: true,
+        jsonSchemaValidation: true, // this test depends on the json schema validation, do not set to false
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo true`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs for type boolean (falsy)", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/types/boolean",
+        file: ".gitlab-ci-2.yml",
+        preview: true,
+        jsonSchemaValidation: true, // this test depends on the json schema validation, do not set to false
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo false`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs inputs validation for boolean", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/type-validation/boolean",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(chalk`\`{blueBright boolean_input}\` input: provided value is not a {blueBright boolean}.`);
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs inputs validation for unsupported type", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/type-validation/unsupported",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`header:spec:inputs:{blueBright unsupported_type_input} input type unknown value: {blueBright foo}.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs options validation", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/options-validation",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`\`{blueBright options_input}\` input: \`{blueBright fizz}\` cannot be used because it is not in the list of allowed options.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs can skip options validation", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/options-validation",
+        preview: true,
+        skipInputValidation: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo fizz`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs options array1 validation", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/options-array1-validation",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo ["foo","baz"]`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs options array2 validation", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/options-array2-validation",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`\`{blueBright options_input}\` input: \`{blueBright fizz}\` cannot be used because it is not in the list of allowed options.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs too many functions in interpolation block", async () => {
+    const writeStreams = new WriteStreamsMock();
+    try {
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/too-many-functions-in-interpolation-block",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain("too many functions in interpolation block.");
+        expect(writeStreams.stderrLines.join("\n")).toContain("interpolation functions is currently not supported");
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+
+test.concurrent("include-inputs interpolation value containing escapes", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/interpolation-value-escapes",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo ^v?(?P<major>[0-9]+)\\.(?P<minor>[0-9]+)\\.(?P<patch>[0-9]+)(?P<suffix>(?P<prerelease>-[0-9A-Za-z-\\.]+)?(?P<build>\\+[0-9A-Za-z-\\.]+)?)$`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs regex validation (invalid)", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/regex-validation",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`\`{blueBright version}\` input: \`{blueBright invalid-version}\` does not match required regex: {blueBright ^v\\d+\\.\\d+\\.\\d+$}.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs can skip regex validation", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/regex-validation",
+        preview: true,
+        skipInputValidation: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+deploy:
+  script:
+    - echo invalid-version`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs regex validation (valid)", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/regex-validation-pass",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+deploy:
+  script:
+    - echo v1.2.3`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs regex validation uses RE2 syntax (valid)", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/include-inputs/input-templates/regex-validation-re2-pass",
+        preview: true,
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+deploy:
+  script:
+    - echo hello`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("include-inputs regex validation uses RE2 syntax (invalid)", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/regex-validation-re2-fail",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain(
+            chalk`\`{blueBright word}\` input: \`{blueBright hello world}\` does not match required regex: {blueBright ^[^[:space:]]+$}.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});
+
+test.concurrent("include-inputs regex validation (invalid pattern)", async () => {
+    try {
+        const writeStreams = new WriteStreamsMock();
+        await handler({
+            cwd: "tests/test-cases/include-inputs/input-templates/regex-validation-invalid-pattern",
+            preview: true,
+        }, writeStreams);
+    } catch (e: any) {
+        assert(e instanceof AssertionError, "e is not instanceof AssertionError");
+        expect(e.message).toContain("This GitLab CI configuration is invalid:");
+        expect(e.message).toContain(
+            chalk`\`{blueBright version}\` input: regex \`{blueBright ^[unclosed}\` is not a valid regular expression.`,
+        );
+        return;
+    }
+
+    throw new Error("Error is expected but not thrown/caught");
+});

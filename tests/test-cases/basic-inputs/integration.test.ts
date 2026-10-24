@@ -1,0 +1,52 @@
+import {WriteStreamsMock} from "../../../src/write-streams.js";
+import {handler} from "../../../src/handler.js";
+import {initSpawnSpy} from "../../mocks/utils.mock.js";
+import {WhenStatics} from "../../mocks/when-statics.js";
+
+beforeAll(() => {
+    initSpawnSpy(WhenStatics.all);
+});
+
+test.concurrent("basic-inputs defaults no inputs", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/basic-inputs/input-templates/default-no-inputs",
+        preview: true,
+        stateDir: ".gitlab-ci-local-basic-inputs-defaults-no-inputs",
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+scan-website:
+  script:
+    - echo string
+    - echo 1
+    - echo true
+    - alice
+    - bob`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});
+
+test.concurrent("basic-inputs slash in key", async () => {
+    const writeStreams = new WriteStreamsMock();
+    await handler({
+        cwd: "tests/test-cases/basic-inputs/input-templates/slash-in-key",
+        preview: true,
+        stateDir: ".gitlab-ci-local-basic-inputs-slash-in-key",
+    }, writeStreams);
+
+    const expected = `---
+stages:
+  - .pre
+  - test
+  - .post
+job:
+  script:
+    - echo "black/enabled=true"`;
+
+    expect(writeStreams.stdoutLines[0]).toEqual(expected);
+});

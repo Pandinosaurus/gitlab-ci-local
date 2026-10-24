@@ -8,7 +8,7 @@ default:
 test job:
   extends: .image
   script:
-    - echo "Test something"
+    - echo "Test something ${GCL_PROJECT_DIR_ON_HOST}"
 
 test-entrypoint:
   # This image have an `echo ${MULTILINE_VARIABLE}` in its entry point
@@ -63,3 +63,25 @@ image-user:
       user: nobody
   script:
     - id -u
+
+image-platform:
+  image:
+    name: alpine
+    docker:
+      platform: linux/amd64
+  script:
+    - uname -m
+
+image-entrypoint-with-variables:
+  variables:
+    FOO: BAR
+  image:
+    name: alpine
+    entrypoint:
+      - sh
+      - -c
+      - |
+        if [ -z "$FOO" ]; then >&2 echo FOO is not defined in entrypoint; exit 1; fi
+        sh "$@"
+  script:
+    - echo "success"
